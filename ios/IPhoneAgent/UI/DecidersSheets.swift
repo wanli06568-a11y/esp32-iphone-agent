@@ -20,10 +20,11 @@ struct ModelFieldsSheet: View {
     }
 }
 
-/// The Jev row's fold: Handsy's server (default), or TypeSafe on your own key.
+/// The Jev row's fold: Manina AI's server (default), or TypeSafe on your own key.
 struct JevFieldsSheet: View {
     @AppStorage(JevConfig.ownKey) private var ownKey = false
     @AppStorage(JevConfig.modelKey) private var model = TypeSafeJev.defaultModel
+    @AppStorage(JevConfig.thresholdKey) private var threshold = JevConfig.defaultThreshold
     @State private var apiKey = JevConfig.apiKey
     @Environment(\.dismiss) private var dismiss
 
@@ -32,7 +33,7 @@ struct JevFieldsSheet: View {
             Form {
                 Section {
                     Picker("Runs on", selection: $ownKey) {
-                        Text(verbatim: "Handsy").tag(false)
+                        Text(verbatim: "Manina AI").tag(false)
                         Text("TypeSafe, your key").tag(true)
                     }
                     if ownKey {
@@ -44,10 +45,24 @@ struct JevFieldsSheet: View {
                         }
                     }
                 } footer: {
-                    Text(ownKey ? "Steps go straight from this iPhone to TypeSafe on your key; Handsy gets nothing. The key stays in this iPhone's Keychain."
-                         : "Steps go to Jev on Handsy's server, free of charge.")
+                    Text(ownKey ? "Steps go straight from this iPhone to TypeSafe on your key; Manina AI gets nothing. The key stays in this iPhone's Keychain."
+                         : "Steps go to Jev on Manina AI's server, free of charge.")
                 }
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
+                Section {
+                    VStack(alignment: .leading, spacing: Space.xs) {
+                        LabeledContent("Confidence needed", value: threshold.formatted(.percent.precision(.fractionLength(0))))
+                        Slider(value: $threshold, in: JevConfig.thresholdRange, step: 0.05)
+                            .accessibilityLabel(Text("Confidence needed"))
+                        Text("Suggested: \(JevConfig.suggestedRange.lowerBound.formatted(.percent.precision(.fractionLength(0))))–\(JevConfig.suggestedRange.upperBound.formatted(.percent.precision(.fractionLength(0))))")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    if threshold != JevConfig.defaultThreshold {
+                        Button("Reset to Default") { threshold = JevConfig.defaultThreshold }
+                    }
+                } footer: {
+                    Text("Jev takes a step only when it is at least this sure; otherwise the Large Language Model decides. Lower is faster, higher is more careful. Manina AI's server may ask for more on some kinds of steps.")
+                }
                 if ownKey, let url = URL(string: "https://typesafe.ai") {
                     Section { KeyLinkRow(title: "Get a TypeSafe key", url: url) }
                 }
@@ -55,7 +70,7 @@ struct JevFieldsSheet: View {
             .navigationTitle("Jev")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-            .onChange(of: apiKey) { Keychain.set(apiKey.trimmingCharacters(in: .whitespacesAndNewlines), for: JevConfig.keychainAccount)
+            .onValueChange(of: apiKey) { Keychain.set(apiKey.trimmingCharacters(in: .whitespacesAndNewlines), for: JevConfig.keychainAccount)
                 DebugLog.redact([apiKey]) }
         }
     }

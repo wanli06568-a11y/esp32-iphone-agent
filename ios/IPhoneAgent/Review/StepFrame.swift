@@ -5,6 +5,7 @@ import SwiftUI
 struct StepFrame: View {
     let step: DraftStep
     var active = true
+    var hidden = false  // blurred until tapped (Settings › Blur screens in reviews)
     private var moves: Bool { step.isMove || step.name == "note" }
 
     var body: some View {
@@ -13,6 +14,18 @@ struct StepFrame: View {
                 Image(uiImage: img)
                     .resizable()
                     .aspectRatio(img.size, contentMode: .fit)
+                    .blur(radius: hidden ? 24 : 0, opaque: true)
+                    .overlay {
+                        if hidden {
+                            VStack(spacing: Space.s) {  // fits a narrow frame: the eye on top, the words wrap centered
+                                Image(systemName: "eye").font(.title2.weight(.semibold))
+                                    .frame(width: 52, height: 52).background(.thinMaterial, in: Circle())
+                                Text("Tap to show the screen").font(.footnote.weight(.semibold)).multilineTextAlignment(.center)
+                                    .foregroundStyle(.white).shadow(color: .black.opacity(0.35), radius: 2)
+                            }
+                            .padding(Space.m)
+                        }
+                    }
                     .overlay { if moves { ActionOverlay(action: step.action, active: active) } }
                     .overlay { if let fix = step.fix { FixMarker(point: fix) } }
                     .overlay {
@@ -29,7 +42,14 @@ struct StepFrame: View {
             } else {
                 RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(uiColor: .tertiarySystemFill))
                     .aspectRatio(9 / 19.5, contentMode: .fit)
-                    .overlay(Image(systemName: StepText.symbol(step.name)).font(.largeTitle).foregroundStyle(.secondary))
+                    .overlay {  // no screen for this step: say what it did, not just an icon that looks tappable
+                        VStack(spacing: Space.s) {
+                            Image(systemName: StepText.symbol(step.name)).font(.largeTitle)
+                            Text(verbatim: StepText.title(step.action)).font(.headline).multilineTextAlignment(.center)
+                            Text("No screen image for this step").font(.footnote)
+                        }
+                        .foregroundStyle(.secondary).padding(Space.l)
+                    }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -101,7 +121,7 @@ struct ActionOverlay: View {
         }
         .allowsHitTesting(false)
         .onAppear { if active { play() } }
-        .onChange(of: active) { _, on in if on { play() } }
+        .onValueChange(of: active) { _, on in if on { play() } }
     }
 
     /// Draws the action in each time its step comes up.

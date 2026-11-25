@@ -63,8 +63,17 @@ struct BottomBar<Content: View>: View {
             .padding(.horizontal, Space.xl)
             .padding(.top, Space.m)
             .padding(.bottom, Space.s)
+            .padWidth(640)
             .frame(maxWidth: .infinity)
             .background(.bar)
+    }
+}
+
+extension View {
+    /// iPad: at most `width` wide and centred, so a page or a button doesn't stretch across a landscape screen.
+    /// An iPhone is never that wide: unchanged.
+    @ViewBuilder func padWidth(_ width: CGFloat) -> some View {
+        if DeviceKind.isPad { frame(maxWidth: width).frame(maxWidth: .infinity) } else { self }
     }
 }
 
@@ -119,6 +128,26 @@ struct ValueRow: View {
 }
 
 /// A row icon in a rounded colored square, like Settings.app.
+/// An intent's icon colour (SavedTask.color), chosen in Save as Intent; nil or "accent" = the app's accent.
+enum IntentTint {
+    static let names = ["accent", "red", "pink", "purple", "indigo", "blue", "teal", "green", "yellow", "gray"]
+
+    static func color(_ name: String?) -> Color {
+        switch name {
+        case "red": return .red
+        case "pink": return .pink
+        case "purple": return .purple
+        case "indigo": return .indigo
+        case "blue": return .blue
+        case "teal": return .teal
+        case "green": return .green
+        case "yellow": return .yellow
+        case "gray": return .gray
+        default: return .accentColor
+        }
+    }
+}
+
 struct SettingsIcon: View {
     let symbol: String
     let color: Color

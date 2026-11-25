@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "freertos/idf_additions.h"
 #include "mbedtls/aes.h"
 #include "../video/gop.h"
 #include "keystream.h"
@@ -45,6 +46,7 @@ static struct {
   uint8_t *held;                        // the last undecodable packet's ciphertext, then its plaintext (PSRAM)
   size_t held_n, held_cap;
   bool held_set, held_ready;            // kept / recovered (forward it before the packet that recovered it)
+  uint8_t held_hdr[8];                  // its packet header (type, option), for the log when it stays lost
   uint32_t bad, bad_logged_ms;
   uint32_t remote_ip;
   uint16_t timing_rport;
@@ -62,6 +64,9 @@ static struct {
   int ct;
   volatile float volume;
 } a;
+
+static volatile uint32_t data_conns;  // airplay_data_conns()
+uint32_t airplay_data_conns(void) { return data_conns; }
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -115,6 +120,20 @@ static void yield(void) { vTaskDelay(1); }  // lets the network tasks run during
 // key and to interleave packets of both, so a single keystream fails on both from then on. Keep a few: each
 // packet goes to the first whose plaintext starts like a frame (most recently used first) and advances it, or
 // starts a new one from iv0. Returns the keystream's number (1-based), or 0 if none fits.
+// A packet dropped for good (2026-11-12: "in step after all: not a frame", then the app decoded nothing for
+// minutes): its header and first 32 plaintext bytes, so the next one shows what the sender put there, and
+// on_lost() so the app can tell the picture may be broken.
+static void lost(const uint8_t *hdr, const uint8_t *p, size_t n) {
+  static int64_t logged_ms;
+  if (ap_cfg.on_lost) ap_cfg.on_lost();
+  if (now_ms() - logged_ms < 1000) return;  // at most once a second
+  logged_ms = now_ms();
+  char hex[65] = {0};
+  for (size_t i = 0; i < 32 && i < n; i++) snprintf(hex + 2 * i, 3, "%02x", p[i]);
+  ap_log("mirror: lost a %u-byte packet (header %02x%02x%02x%02x %02x%02x%02x%02x): %s", (unsigned)n, hdr[0], hdr[1],
+         hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7], hex);
+}
+
 static int decrypt(uint8_t *p, size_t n) {
   static uint32_t clock;
   ks_key kk = key();
@@ -142,12 +161,13 @@ static int decrypt(uint8_t *p, size_t n) {
       // it at that position; if it parses it is a real frame, and dropping it broke every P-frame after it until
       // the next IDR (the "frame"/"Mirror" stalls of 2026-10-20).
       keystream at = *last;
-      mbedtls_aes_crypt_ctr(&m.aes, m.held_n, &at.off, at.iv, at.stream, m.held, m.held);
+      ks_ctr(&m.aes, m.held_n, &at.off, at.iv, at.stream, m.held);
       uint8_t h[8] = {0};
       memcpy(h, m.held, m.held_n < 8 ? m.held_n : 8);
       m.held_ready = avcc_to_annexb(m.held, m.held_n);
       ap_log("mirror: the packet before (%u bytes) was in step after all: %s (starts %02x%02x%02x%02x %02x%02x%02x%02x)",
              (unsigned)m.held_n, m.held_ready ? "recovered" : "not a frame", h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+      if (!m.held_ready) lost(m.held_hdr, m.held, m.held_n);
     } else {
       ap_log("mirror: the sender skipped %u bytes of keystream (dropped frames); picked up again in %d ms",
              (unsigned)skipped, (int)((esp_timer_get_time() - t0) / 1000));
@@ -191,13 +211,13 @@ static void handle_packet(const uint8_t *hdr, uint8_t *p, size_t n) {
     mbedtls_aes_setkey_enc(&clean, key_copy, 128);
     memcpy(fresh.iv, iv0_copy, 16);
     memcpy(p, m.copy, n);
-    mbedtls_aes_crypt_ctr(&clean, n, &fresh.off, fresh.iv, fresh.stream, p, p);
+    ks_ctr(&clean, n, &fresh.off, fresh.iv, fresh.stream, p);
     bool clean_ok = ks_plausible(p, n);
     int ks_clean = 0;
     for (int i = 0; i < m.nks && !ks_clean; i++) {
       next = m.ks[i];
       memcpy(p, m.copy, n);
-      mbedtls_aes_crypt_ctr(&clean, n, &next.off, next.iv, next.stream, p, p);
+      ks_ctr(&clean, n, &next.off, next.iv, next.stream, p);
       if (ks_plausible(p, n)) ks_clean = i + 1;
     }
     mbedtls_aes_free(&clean);
@@ -220,6 +240,7 @@ static void handle_packet(const uint8_t *hdr, uint8_t *p, size_t n) {
     m.held_set = m.held != NULL;
     if (m.held_set) {
       memcpy(m.held, m.copy, n);
+      memcpy(m.held_hdr, hdr, 8);
       m.held_n = n;
     }
     m.bad++;
@@ -239,6 +260,7 @@ static void handle_packet(const uint8_t *hdr, uint8_t *p, size_t n) {
       odd_logged_ms = now_ms();
       ap_log("mirror: frame x%u on keystream %d doesn't parse (%u bytes, type %02x %02x)", (unsigned)odd, k, (unsigned)n, hdr[4], hdr[5]);
     }
+    lost(hdr, p, n);
     return;
   }
   if (m.bad) ap_log("mirror: frames decode again after %u bad (keystream %d)", (unsigned)m.bad, k);
@@ -280,6 +302,8 @@ static void audio_packet(void) {
   ap_cfg.on_audio(ev == AP_GATE_START ? AIRPLAY_AUDIO_START : AIRPLAY_AUDIO_FRAME, frame, rtp.len, rtp.ts);
 }
 
+static TaskHandle_t ext_task;  // the mirror task when its stack is in PSRAM (start_task)
+
 static void mirror_task(void *arg) {
   uint8_t hdr[128], ntp[32] = {0x80, 0xd2, 0x00, 0x07}, scratch[128];
   uint8_t *payload = NULL;
@@ -318,11 +342,20 @@ static void mirror_task(void *arg) {
     if (m.afd[1] >= 0 && FD_ISSET(m.afd[1], &rf)) recv(m.afd[1], scratch, sizeof scratch, 0);  // sync, resends
     if (m.sfd < 0) {
       if (!FD_ISSET(m.lfd, &rf)) continue;
-      m.sfd = accept(m.lfd, NULL, NULL);
+      struct sockaddr_in peer;
+      socklen_t pl = sizeof peer;
+      m.sfd = accept(m.lfd, (struct sockaddr *)&peer, &pl);
+      if (m.sfd >= 0 && ap_cfg.allow_peer && !ap_cfg.allow_peer(peer.sin_addr.s_addr)) {
+        ap_log("mirror: data connection from %s refused (not this board's phone)", inet_ntoa(peer.sin_addr));
+        close(m.sfd);
+        m.sfd = -1;
+        continue;
+      }
       got = 0, need = 128, in_payload = false;
       m.got_codec = false;
       m.logged_no_video = false;
       m.accepted_us = m.sfd >= 0 ? esp_timer_get_time() : 0;
+      if (m.sfd >= 0) data_conns++;
       ap_log("mirror: data connection %s", m.sfd >= 0 ? "accepted" : "failed");
       continue;
     }
@@ -371,7 +404,8 @@ static void mirror_task(void *arg) {
   m.held_set = m.held_ready = false;
   mbedtls_aes_free(&m.aes);
   m.done = true;
-  vTaskDelete(NULL);
+  if (ext_task) vTaskSuspend(NULL);  // a PSRAM stack: deleted by the next start (vTaskDeleteWithCaps), never by itself
+  else vTaskDelete(NULL);
 }
 
 static void derive(const char *label, uint64_t id, const uint8_t aeskey[16], uint8_t out[16]) {
@@ -382,9 +416,22 @@ static void derive(const char *label, uint64_t id, const uint8_t aeskey[16], uin
   memcpy(out, h, 16);
 }
 
+// The mirror task, stack in internal RAM; when that is too short (the StopWatch, 2026-11-22: screen, mic, Bluetooth and
+// the Wi-Fi link leave ~15 KB, and every mirroring setup failed), the stack comes from PSRAM instead.
+static bool start_task(void) {
+  if (xTaskCreatePinnedToCore(mirror_task, "mirror", 8 * 1024, NULL, 6, NULL, 0) == pdPASS) return true;
+  ap_log("mirror: no internal RAM for the task (free %u, largest %u), stack in PSRAM",
+         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  return xTaskCreatePinnedToCoreWithCaps(mirror_task, "mirror", 8 * 1024, NULL, 6, &ext_task, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+}
+
 bool ap_mirror_start(const uint8_t aeskey[16], uint64_t stream_id, uint32_t remote_ip, uint16_t timing_rport) {
   uint8_t key[16];
   ap_mirror_stop();
+  if (ext_task && m.done) {  // the last session's PSRAM-stack task, suspended at its end
+    vTaskDeleteWithCaps(ext_task);
+    ext_task = NULL;
+  }
   derive("AirPlayStreamKey", stream_id, aeskey, key);
   derive("AirPlayStreamIV", stream_id, aeskey, m.iv0);
   memset(m.ks, 0, sizeof m.ks);
@@ -410,7 +457,9 @@ bool ap_mirror_start(const uint8_t aeskey[16], uint64_t stream_id, uint32_t remo
   a.buf = heap_caps_malloc(AUDIO_PACKET_MAX, MALLOC_CAP_SPIRAM);  // NULL: packets are drained, not forwarded
   m.run = true;
   m.done = false;
-  if (m.lfd < 0 || xTaskCreatePinnedToCore(mirror_task, "mirror", 8 * 1024, NULL, 6, NULL, 0) != pdPASS) {
+  if (m.lfd < 0) ap_log("mirror: no socket for port %d (internal RAM free %u)", AP_MIRROR_PORT,
+                        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  if (m.lfd < 0 || (ext_task && !m.done) || !start_task()) {
     m.run = false;
     m.done = true;
     close_fd(&m.lfd);

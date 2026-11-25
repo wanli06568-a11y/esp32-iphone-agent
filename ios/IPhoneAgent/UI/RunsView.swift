@@ -10,6 +10,7 @@ struct RunsView: View {
     @State private var importError: String?
     @State private var showingDeleteError = false
     @State private var deleteError = ""
+    @State private var bulkDelete: Bool?  // asking to delete many runs: true = only the failed ones
 
     var body: some View {
         NavigationStack {
@@ -36,6 +37,21 @@ struct RunsView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { importing = true } label: { Label("Import run", systemImage: "square.and.arrow.down") }
                 }
+                .plainBackground()
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button("Delete Failed Runs", systemImage: "xmark.circle", role: .destructive) { bulkDelete = true }
+                        Button("Delete All Runs", systemImage: "trash", role: .destructive) { bulkDelete = false }
+                    } label: { Label("More", systemImage: "ellipsis.circle") }
+                    .disabled(runs.runs.isEmpty)
+                }
+                .plainBackground()
+            }
+            .confirmationDialog(bulkDelete == true ? LocalizedStringKey("Delete failed runs? This can't be undone.")
+                                                   : LocalizedStringKey("Delete all runs? This can't be undone."),
+                                isPresented: Binding(get: { bulkDelete != nil }, set: { if !$0 { bulkDelete = nil } }),
+                                titleVisibility: .visible, presenting: bulkDelete) { failedOnly in
+                Button(failedOnly ? LocalizedStringKey("Delete Failed Runs") : LocalizedStringKey("Delete All Runs"), role: .destructive) { deleteRuns(failedOnly: failedOnly) }
             }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.zip]) { result in
                 do { try app.importRuns(result.get()) } catch { importError = error.localizedDescription }
@@ -55,6 +71,11 @@ struct RunsView: View {
         app.outcome(for: run) == .running
     }
 
+    private func deleteRuns(failedOnly: Bool) {
+        do { try app.deleteRuns(failedOnly: failedOnly) }
+        catch { deleteError = error.localizedDescription; showingDeleteError = true }
+    }
+
     private func delete(at offsets: IndexSet) {
         let selected = offsets.map { runs.runs[$0] }
         do { for run in selected { try app.deleteRun(run) } }
@@ -68,7 +89,7 @@ struct RunRow: View {
 
     var body: some View {
         HStack(spacing: Space.m) {
-            Thumb(url: run.cover).frame(width: 52, height: 112)
+            if DeviceKind.isPad { Thumb(url: run.cover, fitted: true) } else { Thumb(url: run.cover).frame(width: 52, height: 112) }
             VStack(alignment: .leading, spacing: Space.xs) {
                 Text(verbatim: run.task.isEmpty ? String(localized: "Untitled run") : run.task)
                     .font(.headline).lineLimit(2)
@@ -112,16 +133,37 @@ struct OutcomeLabel: View {
 /// A screenshot from disk, phone-shaped.
 struct Thumb: View {
     let url: URL?
+    /// iPad: shown whole at its own aspect ratio, 112 pt tall and at most 160 pt wide, so a landscape screenshot is
+    /// neither cropped nor spills over the row. Otherwise it fills the frame the caller gives it.
+    var fitted = false
 
     var body: some View {
+        let image = url.flatMap { UIImage(contentsOfFile: $0.path) }
+        if fitted {
+            let size = Self.fitted(image?.size)
+            content(image, fill: false).frame(width: size.width, height: size.height)
+        } else {
+            content(image, fill: true)
+        }
+    }
+
+    private func content(_ image: UIImage?, fill: Bool) -> some View {
         Group {
-            if let url, let img = UIImage(contentsOfFile: url.path) {
-                Image(uiImage: img).resizable().scaledToFill()
+            if let image {
+                if fill { Image(uiImage: image).resizable().scaledToFill() } else { Image(uiImage: image).resizable() }
             } else {
-                Color(uiColor: .tertiarySystemFill).overlay(Image(systemName: "iphone").foregroundStyle(.tertiary))
+                Color(uiColor: .tertiarySystemFill)
+                    .overlay(Image(systemName: DeviceKind.isPad ? "ipad" : "iphone").foregroundStyle(.tertiary))
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color(uiColor: .separator), lineWidth: 0.5))
+    }
+
+    /// The image's size at 112 pt tall, or at 160 pt wide if that is narrower; phone-shaped with no image.
+    static func fitted(_ image: CGSize?) -> CGSize {
+        let aspect = image.flatMap { $0.width > 0 && $0.height > 0 ? $0.width / $0.height : nil } ?? 52 / 112
+        let width = min(112 * aspect, 160)
+        return CGSize(width: width, height: width / aspect)
     }
 }

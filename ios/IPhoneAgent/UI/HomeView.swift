@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 struct HomeView: View {
     @ObservedObject var app: AppModel
     @ObservedObject var board: BoardLink
-    @ObservedObject var feed: VideoFeed
+    let feed: VideoFeed  // not observed: a new frame re-renders only the run card's thumbnail
     @ObservedObject var agent: AgentLoop
     @ObservedObject var settings: Settings
     @ObservedObject var intents: IntentStore
@@ -38,10 +38,9 @@ struct HomeView: View {
                     }
                 }
                 if !recorder.busy && recorder.error == nil {
-                    Section { hero }
+                    Section { hero.id("agent-top") }  // a row, not the Section: iOS 16 crashed scrolling to a Section id
                         .listRowBackground(Color.clear)
                         .listRowInsets(EdgeInsets())
-                        .id("agent-top")
                 }
                 if recorder.busy || recorder.error != nil { RecordingPanel(recorder: recorder).id("recording") }
                 if app.help != nil { HelpPanel(app: app).id("agent-help") }
@@ -52,13 +51,15 @@ struct HomeView: View {
                     intentSection
                 }
             }
-            .onChange(of: agent.running) { _, running in
-                if running { scroll.scrollTo("agent-top", anchor: .top) }
+            .onValueChange(of: agent.running) { _, running in
+                // only on screen: a run starts as the app goes to the background, and iOS 16 crashed in scrollTo
+                // there (2026-11-23, iPhone X, EXC_BAD_ACCESS in SwiftUI under this closure)
+                if running, UIApplication.shared.applicationState == .active { scroll.scrollTo("agent-top", anchor: .top) }
             }
-            .onChange(of: app.help) { _, help in
+            .onValueChange(of: app.help) { _, help in
                 if help != nil { scroll.scrollTo("agent-help", anchor: .top) }
             }
-            .onChange(of: recorder.recording) { _, recording in
+            .onValueChange(of: recorder.recording) { _, recording in
                 if recording { scroll.scrollTo("recording", anchor: .top) }
             }
             .listStyle(.insetGrouped)
@@ -91,13 +92,18 @@ struct HomeView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { recordSheet = true } label: {
-                        Image(systemName: recorder.recording ? "record.circle.fill" : "record.circle")
-                            .foregroundStyle(recorder.recording ? Color.red : Color.primary)
-                            .symbolEffect(.pulse, options: .repeating, isActive: recorder.recording)
+                        // The circle alone was not read as "record" (Henry, 2026-11-15): a caption under it says so.
+                        VStack(spacing: 1) {
+                            Image(systemName: recorder.recording ? "record.circle.fill" : "record.circle")
+                                .pulsing(recorder.recording)
+                            Text(recorder.recording ? "Recording" : "Record").font(.caption2.weight(.medium))
+                        }
+                        .foregroundStyle(recorder.recording ? Color.red : Color.primary)
                     }
-                    .accessibilityLabel(Text("New intent"))
+                    .accessibilityHint(Text("New intent"))
                     .disabled(recorder.busy)
                 }
+                .plainBackground()
             }
             .sheet(isPresented: $recordSheet, onDismiss: finishSourceSelection) {
                 RecordSheet(app: app, recorder: recorder, board: board, agent: agent, runs: app.runs, settings: settings,
@@ -110,6 +116,7 @@ struct HomeView: View {
             .sheet(isPresented: $renaming) { RenameSheet(settings: settings) }
             .sheet(isPresented: $exportingIntents) { IntentExportSheet(app: app, intents: intents.items) }
             .modifier(FirmwareGate(app: app, updater: app.firmware, board: board, agent: agent, recorder: recorder))
+            .modifier(AppUpdateGate())
             .fileImporter(isPresented: $importingIntents, allowedContentTypes: [.esp32Intent, .json]) { result in
                 if case .success(let url) = result { app.importIntents(url) }
             }
@@ -160,7 +167,7 @@ struct HomeView: View {
                 }
             }
             .animation(.spring(response: 0.35, dampingFraction: 0.8), value: app.toast)
-            .onChange(of: app.toast) { _, toast in
+            .onValueChange(of: app.toast) { _, toast in
                 if toast != nil { withAnimation(.linear(duration: 0.4)) { shakes += 1 } }
             }
             .alert("Save as intent", isPresented: $naming) {
@@ -188,6 +195,8 @@ struct HomeView: View {
     private var hero: some View {
         VStack(spacing: Space.m) {
             FirmwareBanner(updater: app.firmware)
+            AppUpdateBanner(firmware: app.firmware)
+            MirrorHintBanner(app: app, busy: agent.running || app.startingAgent)
             PokeableFace(mood: editing ? .listening : app.mood, look: lookAt, busy: app.agent.running,
                          onInteract: { Task { await app.refreshHomeStatus() } })
                 .frame(width: 128, height: 143)
@@ -238,14 +247,7 @@ struct HomeView: View {
     private func liveSection(_ card: RunCardSnapshot) -> some View {
         Section {
             HStack(alignment: .top, spacing: Space.m) {
-                Group {
-                    if let img = card.frame.flatMap({ UIImage(data: $0) })
-                        ?? card.cover.flatMap({ UIImage(contentsOfFile: $0.path) }) {
-                        Image(uiImage: img).resizable().scaledToFit()
-                    } else {
-                        Color(uiColor: .tertiarySystemFill)
-                    }
-                }
+                RunThumbnail(feed: feed, card: card)
                 .frame(width: 64, height: 138)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 VStack(alignment: .leading, spacing: Space.s) {
@@ -257,9 +259,13 @@ struct HomeView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                     }
-                    ProgressView(value: Double(min(card.moveCount, agent.maxSteps)), total: Double(agent.maxSteps))
-                    Text("Step \(card.moveCount) of up to \(agent.maxSteps)")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    ProgressView(value: Double(min(card.moveCount, agent.stepLimit)), total: Double(agent.stepLimit))
+                    Group {
+                        if agent.notebook.items.isEmpty { Text("Step \(card.moveCount)") }
+                        else { Text("Step \(card.moveCount) · \(agent.notebook.items.count) items listed") }
+                    }
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    if agent.running { SteerField(app: app) }
                     if !agent.running && app.canResume {  // stopped before done: go on from its screen
                         Button { Task { await app.resumeRun() } } label: { Label("Continue", systemImage: "play.fill") }
                             .buttonStyle(.bordered).controlSize(.small)
@@ -268,16 +274,18 @@ struct HomeView: View {
             }
             .padding(.vertical, Space.xs)
             .handsyRunAnnotation(liveRunID)  // Siri: "replay this one"
+            .swipeActions(edge: .trailing) {  // like the Runs tab; none while a run is going
+                if let run = card.storedRun, app.canDeleteRun(run) {
+                    Button("Delete", systemImage: "trash", role: .destructive) { delete(run) }
+                }
+            }
         } header: {
             HStack {
                 Text(agent.running ? "Now" : "Last run")
                 Spacer()
                 if let run = card.storedRun, app.canDeleteRun(run) {
                     Menu("Last run options", systemImage: "ellipsis") {
-                        Button("Delete run", systemImage: "trash", role: .destructive) {
-                            do { try app.deleteRun(run) }
-                            catch { deleteError = error.localizedDescription; showingDeleteError = true }
-                        }
+                        Button("Delete run", systemImage: "trash", role: .destructive) { delete(run) }
                     }
                     .labelStyle(.iconOnly)
                     .foregroundStyle(.secondary)
@@ -285,6 +293,11 @@ struct HomeView: View {
                 }
             }
         }
+    }
+
+    private func delete(_ run: Run) {
+        do { try app.deleteRun(run) }
+        catch { deleteError = error.localizedDescription; showingDeleteError = true }
     }
 
     /// The run this card is about: the one in progress, else the newest recorded one.
@@ -325,10 +338,10 @@ struct HomeView: View {
             ForEach(intents.items) { item in
                 NavigationLink(value: item.id) {
                     HStack(spacing: Space.m) {
-                        SettingsIcon(symbol: item.symbol, color: .accentColor)
+                        SettingsIcon(symbol: item.symbol, color: IntentTint.color(item.color))
                         VStack(alignment: .leading, spacing: 2) {
                             Text(verbatim: item.name).font(.body).foregroundStyle(.primary)
-                            Text(verbatim: item.prompt).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            Text(verbatim: IntentStore.maskingNumbers(item.prompt)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer()
                         Button { run(item) } label: {
@@ -373,7 +386,11 @@ struct HomeView: View {
 
     private var bottomBar: some View {
         BottomBar {
-            if app.startingAgent {
+            if app.stopping {  // Stop was tapped: wait for input to be handed back
+                Button {} label: { Label("Stopping…", systemImage: "stop.fill") }
+                    .buttonStyle(BigButton(tint: Palette.stop))
+                    .disabled(true)
+            } else if app.startingAgent {
                 Button { Task { await app.stopAgent() } } label: { Label("Cancel", systemImage: "xmark") }
                     .buttonStyle(BigButton(tint: Palette.stop))
             } else if agent.running {
@@ -422,8 +439,10 @@ struct HomeView: View {
     /// The first thing missing before a run, and the setup page that fixes it.
     private var blocker: (text: LocalizedStringKey, page: SetupPage)? {
         if !board.connected { return ("Connect the board", .connect) }
+        if board.status?.needsWirelessPointer == true { return ("Pair the Bluetooth pointer", .act) }
+        if let status = board.status, status.board != nil, status.inputState == nil { return ("Waiting for the mouse…", .act) }
         if board.status?.ap != "streaming" { return ("Start Screen Mirroring", .see) }
-        if !app.pointer.calibrated { return ("Calibrate the pointer", .act) }
+        if !app.calibrator.hasValidCalibration { return ("Calibrate the pointer", .act) }
         if !app.modelReady { return ("Set up the model", .brain) }
         return nil
     }
@@ -458,5 +477,27 @@ struct RenameSheet: View {
     private func save() {
         settings.agentName = name
         dismiss()
+    }
+}
+
+/// The run card's screen: the live frame while a run goes, else the run's cover. Its own view, so each new frame
+/// re-renders only this thumbnail, and decodes nothing while the app is in the background.
+private struct RunThumbnail: View {
+    @ObservedObject var feed: VideoFeed
+    let card: RunCardSnapshot
+    @Environment(\.scenePhase) private var phase
+
+    var body: some View {
+        if let img = image {
+            Image(uiImage: img).resizable().scaledToFit()
+        } else {
+            Color(uiColor: .tertiarySystemFill)
+        }
+    }
+
+    private var image: UIImage? {
+        guard card.storedRun == nil else { return card.cover.flatMap { UIImage(contentsOfFile: $0.path) } }
+        guard phase != .background else { return nil }
+        return (feed.frame ?? card.frame).flatMap { UIImage(data: $0) }
     }
 }

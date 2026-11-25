@@ -1,7 +1,7 @@
 import Foundation
 
 /// Jev on your own TypeSafe key: the app asks TypeSafe's systemone itself, with the same request and the same
-/// decision as Handsy's Jev server (handsy-trial-gateway worker/jev/src/step.ts; keep the two in step).
+/// decision as Manina AI's Jev server (handsy-trial-gateway worker/jev/src/step.ts; keep the two in step).
 @MainActor final class TypeSafeJev: JevStepping {
     static let defaultBaseURL = "https://api.typesafe.ai/v1"
     static let defaultModel = "jev-latest"
@@ -42,9 +42,14 @@ import Foundation
                 continue
             }
             if code == 429 { return JevAnswer(reason: "rate_limited") }
+            // refusals on the user's side: the run tells them (JevAnswer.userSideMessage)
+            if code == 451 { return JevAnswer(reason: "region_blocked") }
+            if code == 401 || code == 403 { return JevAnswer(reason: "key_invalid") }
+            if code == 402 { return JevAnswer(reason: "no_credit") }
             guard (200..<300).contains(code) else { throw LLMError(message: "Jev: TypeSafe HTTP \(code)", status: code) }
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            return JevRules.reply(steps: steps, response: json) ?? JevAnswer(reason: "invalid_answer")
+            return JevRules.reply(steps: steps, response: json, history: input.history, accept: JevConfig.threshold)
+                ?? JevAnswer(reason: "invalid_answer")
         }
         throw LLMError(message: "Jev: TypeSafe busy")
     }
@@ -53,10 +58,10 @@ import Foundation
 /// step.ts in Swift: which plan step is due, its operation, a box per step; the DO line when Jev is sure.
 enum JevRules {
     typealias Step = (key: String, text: String)
-    static let accept = 0.7
+    static let accept = 0.7  // the server's minimum for every operation but TAP (TAP: the user's setting)
 
     static let rules = """
-        Advance the user's goal on this iPhone screen using one supported operation.
+        Advance the user's goal on this \(DeviceKind.name) screen using one supported operation.
         The screen was parsed from a screenshot: elements are OCR text lines, detected icons/images/controls,
         filled shapes (buttons, fields, cards) and layout groups (rows, cells, empty areas), with their position.
         Icons have no names; an icon's label is the text next to it when there is one.
@@ -115,21 +120,23 @@ enum JevRules {
         "\(goal)\nPlan:\n\(plan.isEmpty ? "(none)" : plan)\nRecent actions:\n\(history ?? "(none)")"
     }
 
-    /// The systemone body; the screenshot goes in assets.
+    static let boxNow = "box_now"
+
+    /// The systemone body, as the server's (step.ts buildStepRequest): goal, plan and recent actions in the state
+    /// beside the screenshot (in assets); the due plan step (for OPEN / TYPE text and the final-action check), the
+    /// operation, and one Box for the element to tap now.
     static func request(goal: String, steps: [Step], image: Data, model: String) -> [String: Any] {
         let ref = "screenshot-1"
         var criteria = Dictionary(uniqueKeysWithValues: steps.map { ("step \($0.key)", $0.text) })
         criteria["done"] = "The goal is visibly complete."
         criteria["other"] = "Something the plan does not cover."
-        var questions: [String: Any] = [
+        let questions: [String: Any] = [
             "step": ["type": "choice", "criteria": criteria, "instructions": ["goal": goal, "rules": stepRules]],
-            "operation": ["type": "choice", "criteria": operations,
-                          "instructions": ["goal": goal, "rules": [rules, "The operation for the plan step to perform now."]]],
+            "operation": ["type": "choice", "criteria": operations, "instructions": [
+                "goal": goal, "rules": "Which operation should the agent do now on this \(DeviceKind.name) screen to advance the goal?"]],
+            boxNow: ["type": "box", "instructions": "In `screenshot`, the element to tap now for the next step of the goal."],
         ]
-        for step in steps {
-            questions["box_\(step.key)"] = ["type": "box", "instructions": "In `screenshot`, the element to tap for: \(step.text)"]
-        }
-        return ["model": model, "state": ["screenshot": ref], "questions": questions,
+        return ["model": model, "state": ["task": goal + "\n\n" + rules, "screenshot": ref], "questions": questions,
                 "assets": [ref: ["type": "image", "format": "jpg", "data_base64": image.base64EncodedString()]]]
     }
 
@@ -175,8 +182,32 @@ enum JevRules {
         return (b, c)
     }
 
-    /// As the server: TAP = min(p(op), box confidence), else p(op); accept at 0.7 or more.
-    static func reply(steps: [Step], response: [String: Any]) -> JevAnswer? {
+    /// One of the run's last `recentTaps` taps was at this spot: the model decides (tapping again may undo it,
+    /// or loop: tap A, tap B, tap A again even when every step changed the screen). As the server's
+    /// repeatsRecentTap.
+    static let recentTaps = 4
+    static func repeatsRecentTap(_ line: String, history: String?) -> Bool {
+        let tap = line.split(separator: " ")
+        guard tap.count == 3, tap[0] == "tap", let x = Int(tap[1]), let y = Int(tap[2]), let history else { return false }
+        return history.components(separatedBy: "\n").compactMap { groups(tapAt, $0) }.suffix(recentTaps)
+            .contains { m in Int(m[1]).map { abs(x - $0) <= 30 } == true && Int(m[2]).map { abs(y - $0) <= 30 } == true }
+    }
+    private static let tapAt = re(#""action":\s*"tap",\s*"x":\s*(\d+),\s*"y":\s*(\d+)"#)
+
+    /// The least p a step needs, per operation, as the server's: TAP at the user's `threshold`, 0.1 more right after
+    /// a round that left the screen unchanged (the last tap may have missed); every other operation at least
+    /// `accept`. WAIT is never taken (see `reply`).
+    static func acceptFloor(_ op: String, threshold: Double, history: String?) -> Double {
+        guard op == "TAP" else { return max(threshold, accept) }
+        let last = history?.components(separatedBy: "\n").last { $0.contains(" -> screen ") }
+        let raised = threshold + (last?.contains(" -> screen did NOT change") == true ? 0.1 : 0)
+        return (raised * 100).rounded() / 100  // as the server: two decimals
+    }
+
+    /// As the server: TAP = min(p(op), box confidence), else p(op); accept at `acceptFloor` or more. WAIT is left
+    /// to the model, which sees more of what the screen is waiting for.
+    static func reply(steps: [Step], response: [String: Any], history: String? = nil,
+                      accept threshold: Double = JevConfig.defaultThreshold) -> JevAnswer? {
         let a = response["answers"] as? [String: Any] ?? [:]
         guard let step = validChoice(a["step"], steps.map { "step \($0.key)" } + ["done", "other"]),
               let op = validChoice(a["operation"], Array(operations.keys)) else { return nil }
@@ -184,6 +215,7 @@ enum JevRules {
         let text = steps.first { $0.key == key }?.text ?? ""
         let no = { (reason: String) in JevAnswer(accept: false, step_text: text, reason: reason) }
         var prob = op.probabilities[op.choice] ?? 0
+        let accept = acceptFloor(op.choice, threshold: threshold, history: history)
         func sure(_ line: String) -> JevAnswer {
             JevAnswer(accept: prob >= accept, do: line, step_text: text, prob: prob, reason: prob >= accept ? nil : "low_confidence")
         }
@@ -192,25 +224,37 @@ enum JevRules {
         guard jevOps.contains(op.choice) else { return no("op_not_allowed") }
         var box: [String: Double]?
         if op.choice == "TAP" {
-            guard let b = validBox(a["box_\(key!)"]) else { return no("no_box") }
+            guard let b = validBox(a[boxNow] ?? a["box_\(key!)"]) else { return no("no_box") }
             box = b.box
             prob = min(prob, b.confidence)
             if matches(finalAction, text) { return no("final_action") }
         }
         guard let line = doLine(op.choice, text, box: box) else { return no("no_action") }
+        if repeatsRecentTap(line, history: history) { return no("repeat") }
+        if op.choice == "WAIT" { return no("wait") }
         return sure(line)
     }
 }
 
-/// Where Jev runs: Handsy's server (default), or TypeSafe on the user's own key (Settings › Jev).
+/// Where Jev runs: Manina AI's server (default), or TypeSafe on the user's own key (Settings › Jev).
 enum JevConfig {
     static let ownKey = "jev.ownKey"   // UserDefaults: use the user's TypeSafe key
     static let modelKey = "jev.model"  // UserDefaults: the TypeSafe model, default jev-latest
+    static let thresholdKey = "jev.threshold"  // UserDefaults: how sure Jev must be to take a step
+    static let defaultThreshold = 0.55
+    static let thresholdRange = 0.5...0.9
+    /// Shown under the slider: the range where Jev's taps were measured right most of the time.
+    static let suggestedRange = 0.55...0.65
+    /// The user's setting. On Manina AI's server it can only raise the server's own per-operation minimum.
+    static var threshold: Double {
+        let v = UserDefaults.standard.object(forKey: thresholdKey) as? Double ?? defaultThreshold
+        return min(thresholdRange.upperBound, max(thresholdRange.lowerBound, v))
+    }
     static let keychainAccount = "jev-typesafe-key"
 
     static var apiKey: String { Keychain.get(keychainAccount) ?? "" }
     static var model: String { UserDefaults.standard.string(forKey: modelKey) ?? TypeSafeJev.defaultModel }
-    /// On, with a key: steps go to TypeSafe directly, not to Handsy.
+    /// On, with a key: steps go to TypeSafe directly, not to Manina AI.
     static var ownActive: Bool { UserDefaults.standard.bool(forKey: ownKey) && !apiKey.isEmpty }
 
     @MainActor static func client() -> JevStepping {

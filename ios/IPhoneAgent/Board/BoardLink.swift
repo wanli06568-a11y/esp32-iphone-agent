@@ -31,6 +31,13 @@ import Foundation
     var onLinkDown: (() -> Void)?
     private var lastNotify = 0.0  // last notification of any kind, to tell a supervision timeout from a peer drop
     private var statusRevision = 0
+    private var revisionAtDisconnect = 0
+    private var wirelessBoardID: UUID?
+    private var currentStatus: BoardStatus? { statusRevision == revisionAtDisconnect ? nil : status }
+    var needsWirelessPointer: Bool {
+        if let currentStatus { return currentStatus.isWirelessHID && (!connected || !currentStatus.inputReady) }
+        return wirelessBoardID != nil && pairedID == wirelessBoardID
+    }
     private var readySince = 0.0
     var log: (String) -> Void = { print($0) }
 
@@ -51,6 +58,7 @@ import Foundation
     init(mock: Bool = false) {
         self.mock = mock
         super.init()
+        commands.boardStatus = { [weak self] in self?.currentStatus }
         pairedID = UserDefaults.standard.string(forKey: Self.pairedKey).flatMap(UUID.init)
         commands.transport = self
         if mock { return }
@@ -114,7 +122,7 @@ import Foundation
         }
         // A board already connected by another app may no longer advertise.
         for p in central.retrieveConnectedPeripherals(withServices: [BoardUUID.service]) {
-            discovered(p, name: p.name ?? "ESP32 Agent", rssi: 0)
+            discovered(p, name: p.name ?? BoardName.current, rssi: 0)
         }
     }
 
@@ -126,6 +134,7 @@ import Foundation
 
     /// Connect to a board and remember it; reading `net` then triggers the iOS pairing prompt.
     func pair(_ id: UUID) {
+        if id != pairedID { status = nil; wirelessBoardID = nil }
         if mock { return mockPair(id) }
         stopScan()
         pairedID = id
@@ -154,6 +163,8 @@ import Foundation
         peripheral = nil
         if let previous { central?.cancelPeripheralConnection(previous) }
         pairedID = nil
+        status = nil
+        wirelessBoardID = nil
         signalStrength = nil
         UserDefaults.standard.removeObject(forKey: Self.pairedKey)
         setDisconnected()
@@ -188,7 +199,7 @@ import Foundation
     /// it drops a new bond, and iOS then keeps a bond the board no longer has. Fix: replug the board, forget it on
     /// the phone, pair again. Apps cannot forget a bond themselves.
     static var forgetBoard: String {
-        String(localized: "Pairing failed. Replug the board, then forget ESP32 Agent in Settings › Bluetooth.")
+        String(localized: "Pairing failed. Replug the board, then forget \(BoardName.current) in Settings › Bluetooth.")
     }
 
     /// iOS says "Peer removed pairing information" when the board was reflashed or refused a new bond.
@@ -231,6 +242,7 @@ import Foundation
         }
         peripheral.delegate = self
         name = peripheral.name ?? name
+        BoardName.seen(name)
         connecting = true
         log("BLE connecting to \(name)")
         connectionDeadline?.cancel()
@@ -298,7 +310,7 @@ import Foundation
     func mockFound() {
         state = .poweredOn
         pairedID = nil
-        found = [Found(id: UUID(), name: "ESP32 Agent 7C3E", rssi: -58)]
+        found = [Found(id: UUID(), name: "\(AppName.current) 7C3E", rssi: -58)]
     }
 
     private func mockPair(_ id: UUID) {
@@ -306,7 +318,7 @@ import Foundation
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             scanning = false
-            mockConnect(name: "ESP32 Agent 7C3E",
+            mockConnect(name: "\(AppName.current) 7C3E",
                         net: NetConfig(mode: "ap", ssid: "ESP32Agent-7C3E", pass: "demo-pass", ip: "192.168.4.1"))
         }
     }
@@ -317,15 +329,23 @@ import Foundation
         self.name = name
         self.net = net
         pairedID = pairedID ?? UUID()
-        found = [Found(id: UUID(), name: "ESP32 Agent 7C3E", rssi: -71)]
+        found = [Found(id: UUID(), name: "\(AppName.current) 7C3E", rssi: -71)]
+        status = currentStatus
         connected = true
         commands.linkUp()
         onLinkUp?()
     }
 
-    func mockStatus(_ s: BoardStatus) {
-        status = s
-        onStatus?(s)
+    func updateStatus(_ s: BoardStatus) {
+        let merged = (currentStatus?.merged(with: s) ?? s).seen(by: DeviceInfo.model)
+        // Either transport: the pointer the app tracked is gone (Bluetooth dropped, USB unplugged or asleep), so
+        // in-flight moves and the known position no longer hold.
+        if status?.inputReady == true && !merged.inputReady { commands.inputLinkLost() }
+        wirelessBoardID = merged.isWirelessHID ? (peripheral?.identifier ?? pairedID) : nil
+        statusRevision += 1
+        status = merged
+        onStatus?(merged)
+        commands.flushUI()  // StopWatchUI: nothing for other boards
     }
 
     private func mockReply(_ line: String) {
@@ -358,11 +378,13 @@ import Foundation
         }
     }
 
-    private func setDisconnected() {
+    func setDisconnected() {
         statusReads?.cancel()
         connectionDeadline?.cancel()
         connecting = false
         net = nil
+        revisionAtDisconnect = statusRevision
+        if status?.isWirelessHID == true { status = nil }
         let was = connected
         connected = false
         linking = false
@@ -402,7 +424,8 @@ extension BoardLink: CBCentralManagerDelegate {
     nonisolated func centralManager(_ central: CBCentralManager, didDiscover p: CBPeripheral,
                                     advertisementData: [String: Any], rssi: NSNumber) {
         MainActor.assumeIsolated {
-            let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? p.name ?? "ESP32 Agent"
+            let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? p.name ?? BoardName.current
+            BoardName.seen(name)
             discovered(p, name: name, rssi: rssi.intValue)
         }
     }
@@ -412,6 +435,7 @@ extension BoardLink: CBCentralManagerDelegate {
             guard p === peripheral else { return }
             connecting = false
             name = p.name ?? name
+            BoardName.seen(name)
             linking = true
             log("board connected, discovering")
             p.discoverServices([BoardUUID.service])
@@ -513,6 +537,8 @@ extension BoardLink: CBPeripheralDelegate {
                     if linking && subscribed.isSuperset(of: [BoardUUID.reply, BoardUUID.status, BoardUUID.video]) {
                         connectionDeadline?.cancel()
                         stopScan()
+                        // Keep offline diagnostics until reconnect; a status may already have arrived during pairing.
+                        status = currentStatus
                         connected = true
                         linking = false
                         lastError = ""
@@ -537,14 +563,32 @@ extension BoardLink: CBPeripheralDelegate {
             case BoardUUID.video: onVideo?(v)
             case BoardUUID.reply: commands.handleReply(String(decoding: v, as: UTF8.self))
             case BoardUUID.status:
-                if let s = BoardStatus.decode(v) {
-                    let merged = status?.merged(with: s) ?? s
-                    statusRevision += 1
-                    status = merged
-                    onStatus?(merged)
-                }
+                if let s = BoardStatus.decode(v) { updateStatus(s) }
             default: break
             }
         }
+    }
+}
+
+/// The name the board shows in Screen Mirroring and Bluetooth, without its " 1A2B" suffix. Texts that point at it
+/// use the board last seen (kept across launches): firmware builds can carry different names. Before any board
+/// was seen it is the app's own name, which a board on this build's firmware carries too.
+enum BoardName {
+    static let key = "boardFamilyName"
+    /// Before any board was seen: the firmware's own default, not the app's name (a store build is "Manina AI",
+    /// its board still "ESP32 Agent").
+    nonisolated static var current: String { UserDefaults.standard.string(forKey: key) ?? "ESP32 Agent" }
+
+    /// "ESP32 Agent 7C3E" → "ESP32 Agent"; a name without the suffix is kept whole.
+    nonisolated static func family(_ name: String) -> String? {
+        let parts = name.split(separator: " ")
+        let suffixed = parts.count > 1 && parts.last!.count == 4 && parts.last!.allSatisfy(\.isHexDigit)
+        let family = (suffixed ? parts.dropLast() : parts[...]).joined(separator: " ")
+        return family.isEmpty ? nil : family
+    }
+
+    nonisolated static func seen(_ name: String) {
+        guard let family = family(name), family != UserDefaults.standard.string(forKey: key) else { return }
+        UserDefaults.standard.set(family, forKey: key)
     }
 }

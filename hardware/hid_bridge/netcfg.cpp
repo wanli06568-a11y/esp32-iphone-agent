@@ -8,6 +8,9 @@
 #include <esp_coexist.h>
 #include <esp_wifi.h>
 #include "wifi_video.h"
+#include "src/net/lan_lock.h"
+#include "src/airplay/airplay.h"
+#include "logbuf.h"
 
 #if STA_FROM_SECRETS
 #if __has_include("secrets.h")
@@ -23,6 +26,9 @@ static Preferences prefs;
 static String apSsid, apPass, staSsid, staPass, mode;  // mode: "ap" | "sta"
 static String pending;
 static SemaphoreHandle_t pendingLock = xSemaphoreCreateMutex();
+// Joining a home network without a restart: AirPlay is advertised again once it is up (airplay_readvertise).
+static uint32_t changedAt = 0;
+static bool readvertise = false;
 // STA retries back off: a tight reconnect loop starves BLE, which shares the radio.
 static uint32_t retryAt = 0, retryGap = 5000;
 
@@ -85,7 +91,9 @@ static void startWifi() {
     WiFi.setAutoReconnect(false);
     retryGap = 5000;
     retryAt = millis() + retryGap;
-    if (staPass.isEmpty()) WiFi.setMinSecurity(WIFI_AUTH_OPEN);  // the core rejects open networks by default
+    // The core rejects open networks by default. Set both ways: once lowered for an open network, a network with
+    // a password afterwards would also have been joined by an open look-alike with its name.
+    WiFi.setMinSecurity(staPass.isEmpty() ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK);
     WiFi.begin(staSsid.c_str(), staPass.c_str());
   } else {
     WiFi.mode(WIFI_AP);
@@ -134,8 +142,32 @@ void net_begin() {
   staPass = WIFI_PASS;
 #endif
   if (mode == "sta" && staSsid.isEmpty()) mode = "ap";
+  lan_set_station(mode == "sta");
+  lan_set_owner(mode == "sta" ? prefs.getUInt("lan_owner", 0) : 0);
   startWifi();
-  net_coex("balance");
+  bool coexSet = net_coex("balance");
+  wifi_ps_type_t ps = WIFI_PS_NONE;
+  esp_wifi_get_ps(&ps);
+  // Wi-Fi and BLE share one radio: what it is told at boot (esp_coex_preference_set is deprecated in IDF 5 and
+  // may do nothing; the `diag` lines show what the radio share does to the video).
+  board_log("radio: coex %s (%s), coex lib %s, wifi ps %d", net_coex_mode(), coexSet ? "set" : "refused",
+            esp_coex_version_get(), (int)ps);
+}
+
+void net_radio(int *channel, int *rssi) {
+  uint8_t primary = 0;
+  wifi_second_chan_t second;
+  *channel = esp_wifi_get_channel(&primary, &second) == ESP_OK ? primary : 0;
+  *rssi = 0;
+  wifi_mode_t m = WIFI_MODE_NULL;
+  if (esp_wifi_get_mode(&m) != ESP_OK) return;
+  if (m & WIFI_MODE_STA) {
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) *rssi = ap.rssi;
+  } else if (m & WIFI_MODE_AP) {
+    static wifi_sta_list_t list;  // only the status task asks
+    if (esp_wifi_ap_get_sta_list(&list) == ESP_OK && list.num > 0) *rssi = list.sta[0].rssi;
+  }
 }
 
 static const char *coexNames[] = {"wifi", "bt", "balance"};  // esp_coex_prefer_t order
@@ -173,12 +205,18 @@ static void retrySta() {
 
 void net_poll() {
   retrySta();
+  // a station is up once it has an address
+  if (readvertise && net_up() && millis() - changedAt > 1500) {
+    readvertise = false;
+    airplay_readvertise();
+  }
   xSemaphoreTake(pendingLock, portMAX_DELAY);
   String j = pending;
   pending = "";
   xSemaphoreGive(pendingLock);
   if (j.isEmpty()) return;
   String m = jsonStr(j, "mode");
+  String wasMode = mode, wasSsid = staSsid;
   if (m == "ap" || m == "off") {
     mode = m;
   } else if (m == "sta" && jsonStr(j, "ssid").length()) {
@@ -191,7 +229,29 @@ void net_poll() {
     return;  // malformed write: keep the current link
   }
   prefs.putString("mode", mode);
+  // Another network (or none): the owner was this phone's address on the old one.
+  if (mode != wasMode || staSsid != wasSsid) net_set_owner(0);
+  lan_set_station(mode == "sta");
+  // Back to the hotspot from a home network: restart, the hotspot as at every boot. Without one no phone found the
+  // receiver on it (iPhone 15, 2026-11-17): the mDNS responder announced on the hotspot's interface did not answer,
+  // and starting it over right after softAP() crashed the board. The app waits for the board and joins its
+  // hotspot after a restart anyway; the stored mode applies at boot.
+  if (mode == "ap" && wasMode == "sta") {
+    board_log("net: back to the hotspot; restarting");
+    delay(300);  // the status and log lines out first
+    ESP.restart();
+  }
   startWifi();
+  changedAt = millis();
+  readvertise = mode == "sta";
+}
+
+bool net_set_owner(uint32_t ip) {
+  if (mode != "sta") ip = 0;
+  if (lan_owner() == ip) return false;
+  lan_set_owner(ip);
+  prefs.putUInt("lan_owner", ip);
+  return true;
 }
 
 String net_json(bool vtok) {

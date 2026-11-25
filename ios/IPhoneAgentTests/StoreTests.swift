@@ -3,6 +3,14 @@ import XCTest
 
 /// Runs read back from trace folders (what the Runs list and the replay player show), and saved intents.
 @MainActor final class StoreTests: XCTestCase {
+    /// 2026-11-13: Home's intent list never shows a whole phone number; the intent keeps it.
+    func testListSubtitlesMaskPhoneNumbers() {
+        XCTAssertEqual(IntentStore.maskingNumbers("Call 12345678901 and book"), "Call 123••••••01 and book")
+        XCTAssertEqual(IntentStore.maskingNumbers("Text +1 555-010-0199: hi"), "Text +155••••••99: hi")
+        XCTAssertEqual(IntentStore.maskingNumbers("给 123 4567 8901 发消息"), "给 123••••••01 发消息")
+        XCTAssertEqual(IntentStore.maskingNumbers("Set an alarm for 7:00, 3 times, room 12345"), "Set an alarm for 7:00, 3 times, room 12345")
+    }
+
     func testEmptyActiveRunIsNotFailedButAbandonedRunIs() {
         let run = Run(id: "pending", folder: URL(fileURLWithPath: "/tmp/pending"),
                       task: "Open Notes", date: Date(), steps: [])
@@ -43,7 +51,35 @@ import XCTest
         XCTAssertEqual(store.items.first?.name, "Open Notes and write hello")
         XCTAssertEqual(IntentStore(defaults: defaults).items.count, store.items.count)
         store.delete(at: IndexSet(integer: 0))
-        XCTAssertEqual(IntentStore(defaults: defaults).items.first?.name, IntentStore.examples[0].name)
+        XCTAssertEqual(IntentStore(defaults: defaults).items.first?.name, IntentStore.text.name)  // the templates lead
+    }
+
+    /// Text and call come first, as templates that do not run until their blanks are filled in; an install that
+    /// already has intents gets them once at the top, and deleting them sticks.
+    func testTextAndCallTemplatesLeadAndNeedEditing() {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let fresh = IntentStore(defaults: defaults)
+        XCTAssertEqual(fresh.items.prefix(2).map(\.name), [IntentStore.text.name, IntentStore.call.name])
+        XCTAssertTrue(fresh.items[0].unfilled && fresh.items[1].unfilled)
+        XCTAssertFalse(IntentStore.note.unfilled)
+        XCTAssertFalse(IntentStore.unfilled("Call Mom and talk about dinner"))
+
+        let old = UserDefaults(suiteName: UUID().uuidString)!
+        old.set(try? JSONEncoder().encode([IntentStore.note]), forKey: "savedTasks")
+        old.set(true, forKey: "seededDiagnosticsIntent")
+        let store = IntentStore(defaults: old)
+        XCTAssertEqual(store.items.map(\.name), [IntentStore.text.name, IntentStore.call.name, IntentStore.note.name])
+        store.delete(at: IndexSet(integer: 0))
+        XCTAssertEqual(IntentStore(defaults: old).items.count, 2)
+    }
+
+    func testCallGuideOnlyForCallTasks() {
+        XCTAssertTrue(Calls.isCall("Call Mom and talk about dinner"))
+        XCTAssertTrue(Calls.isCall("打电话给妈妈，聊晚饭"))
+        XCTAssertFalse(Calls.isCall("在淘宝把耳机加到购物车"))
+        XCTAssertFalse(Calls.isCall("Open Settings on this iPhone and recall the last note"))
+        XCTAssertEqual(Calls.prompt("Open Notes"), "")
+        XCTAssertEqual(try Actions.parseCommand("say \"你好，我是助手\""), ["action": .str("say"), "text": .str("你好，我是助手")])
     }
 
     func testDeletingRunRemovesRecordingAndPersistsAfterReload() throws {
@@ -62,6 +98,29 @@ import XCTest
         XCTAssertTrue(store.runs.isEmpty)
         store.reload()
         XCTAssertTrue(store.runs.isEmpty)
+    }
+
+    /// Runs tab › Delete All Runs: every run but the one in progress goes; Delete Failed Runs keeps the done ones too.
+    func testBulkDeleteRemovesAllButTheActiveRun() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lasts = ["20261120-100000": "done", "20261120-100100": "error", "20261120-100200": "stopped", "20261120-100300": "error"]
+        for (name, last) in lasts {
+            let folder = root.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data("{\"kind\":\"task\",\"task\":\"t\"}\n{\"kind\":\"step\",\"action\":\"\(last)\"}\n".utf8)
+                .write(to: folder.appendingPathComponent("steps.jsonl"))
+        }
+        let store = RunStore(traces: TraceStore(root: root))
+        store.reload()
+        let active = "20261120-100300"  // in progress: its swipe is disabled, so bulk delete skips it too
+
+        let failed = AppModel.bulkDeletable(store.runs, failedOnly: true) { $0.id != active }
+        XCTAssertEqual(failed.map(\.id), ["20261120-100100"])
+
+        for run in AppModel.bulkDeletable(store.runs, failedOnly: false, canDelete: { $0.id != active }) { try store.delete(run) }
+        store.reload()
+        XCTAssertEqual(store.runs.map(\.id), [active])
     }
 
     func testFailedDiskRemovalKeepsRunVisibleAndReportsError() throws {
@@ -102,6 +161,30 @@ import XCTest
                                            liveFrame: Data([1]), storedRun: nil))
     }
 
+    func testDeletingLastRunCardsRunHidesTheCard() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let traces = TraceStore(root: root)
+        for (folder, task) in [("20260101-090000", "Older run"), ("20260101-100000", "Last run")] {
+            traces.open(root.appendingPathComponent(folder))
+            traces.write(kind: "task", ["task": .str(task)])
+        }
+        let id = "20260101-100000"
+        let store = RunStore(traces: traces)
+        store.reload()
+        let card = try XCTUnwrap(RunCardSnapshot.select(running: false, liveTask: "", liveSteps: [], liveFrame: nil,
+                                                       storedRun: store.run(id)))
+        let target = try XCTUnwrap(card.storedRun)
+        XCTAssertEqual(target.id, id)
+
+        try store.delete(target)
+
+        XCTAssertNil(store.run(id))
+        XCTAssertEqual(store.runs.map(\.task), ["Older run"])
+        XCTAssertNil(RunCardSnapshot.select(running: false, liveTask: "", liveSteps: [], liveFrame: nil,
+                                           storedRun: store.run(id)))
+    }
+
     func testActiveRunCardUsesLiveProgressAndOffersNoStoredDeleteTarget() throws {
         let old = Run(id: "old", folder: URL(fileURLWithPath: "/tmp/old"), task: "Old task", date: Date(), steps: [])
         let frame = Data([1, 2, 3])
@@ -113,5 +196,79 @@ import XCTest
         XCTAssertEqual(card.frame, frame)
         XCTAssertNil(card.cover)
         XCTAssertNil(card.storedRun)
+    }
+
+    func testToolsReadSearchAnswersAndRefuseBadFiles() throws {
+        let exa = #"{"results":[{"title":"清闲智能","url":"https://qingxian.com/","text":"动态人机工学椅 OC1"}]}"#
+        XCTAssertEqual(ToolRunner.text(Data(exa.utf8)), "- 清闲智能: 动态人机工学椅 OC1 (https://qingxian.com/)")
+        XCTAssertEqual(ToolRunner.text(Data(#"{"result":"42"}"#.utf8)), "42")
+        XCTAssertEqual(ToolRunner.text(Data("plain".utf8)), "plain")
+
+        let store = ToolStore(defaults: UserDefaults(suiteName: "tools-" + UUID().uuidString)!)
+        XCTAssertNotNil(store.add(json: Data("nope".utf8)))
+        XCTAssertNotNil(store.add(json: Data(#"{"id":"web","title":"t","about":"a","url":"https://x.y"}"#.utf8)), "a built-in's id")
+        XCTAssertNotNil(store.add(json: Data(#"{"id":"docs","title":"t","about":"a","url":"http://x.y"}"#.utf8)), "https only")
+        XCTAssertNil(store.add(json: Data(#"{"id":"docs","title":"Docs","about":"Search our docs.","url":"https://x.y/s"}"#.utf8)))
+        XCTAssertEqual(store.imported.map(\.id), ["docs"])
+        XCTAssertTrue(ToolStore.prompt([]).isEmpty, "no tool on: the prompt says nothing")
+
+        let tool = try XCTUnwrap(store.imported.first)
+        let request = try XCTUnwrap(ToolRunner.request(tool, query: "q", key: "k", run: "r1"))
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer k")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Run-ID"), "r1")
+        let sent = try XCTUnwrap(JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any])
+        XCTAssertEqual(sent["query"] as? String, "q")
+        // export → import on another iPhone: the same tools, a keyless one stays keyless
+        XCTAssertNil(store.add(json: Data(#"{"id":"wiki","title":"Wiki","about":"a","url":"https://w.k/s","key_header":null}"#.utf8)))
+        let other = ToolStore(defaults: UserDefaults(suiteName: "tools-" + UUID().uuidString)!)
+        XCTAssertNil(other.add(json: store.export()))
+        XCTAssertEqual(other.imported, store.imported)
+        XCTAssertNil(other.imported.last?.key_header)
+        XCTAssertNotNil(other.add(json: Data(#"[{"id":"ok_one","title":"t","about":"a","url":"https://x.y"},{"id":"bad","title":"t","about":"a","url":"http://x.y"}]"#.utf8)))
+        XCTAssertFalse(other.imported.contains { $0.id == "ok_one" }, "a list is added whole or not at all")
+        store.remove("docs")
+        store.remove("wiki")
+        XCTAssertTrue(store.imported.isEmpty)
+    }
+
+    /// Manina AI Search without a key: the switch stays as the user left it, but the tool is not in use.
+    func testManinaSearchNeedsAKey() {
+        let store = ToolStore(defaults: UserDefaults(suiteName: "tools-" + UUID().uuidString)!)
+        XCTAssertTrue(store.enabled.contains(ToolStore.handsy.id), "on by default")
+        XCTAssertFalse(store.usable(ToolStore.handsy, keyed: false))
+        XCTAssertTrue(store.usable(ToolStore.handsy, keyed: true))
+    }
+
+    func testPruneKeepsNewestAndReferencedRunsAndFitsTheBudget() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("prune-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let names = ["20261101-100000", "20261102-100000", "20261103-100000", "20261104-100000"]
+        for name in names {
+            let d = root.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+            try Data(count: 100_000).write(to: d.appendingPathComponent("001.jpg"))
+        }
+        // Under the budget: nothing goes.
+        XCTAssertEqual(TraceStore.prune(root, keep: [], budget: 10_000_000), [])
+        // Over it: the oldest unreferenced runs go; the newest and the intent's run stay.
+        let removed = TraceStore.prune(root, keep: ["20261101-100000"], budget: 1)
+        XCTAssertEqual(removed, ["20261102-100000", "20261103-100000"])
+        let left = try FileManager.default.contentsOfDirectory(atPath: root.path).sorted()
+        XCTAssertEqual(left, ["20261101-100000", "20261104-100000"])
+    }
+
+    func testPruneKeepsEachIntentsNewestRun() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("prune-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runs = [("20261101-100000", "A"), ("20261102-100000", "A"), ("20261103-100000", nil), ("20261104-100000", "B")]
+        for (name, intent) in runs {
+            let d = root.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+            let head = intent.map { #"{"n": 1, "kind": "task", "intent": "\#($0)"}"# } ?? #"{"n": 1, "kind": "task"}"#
+            try Data((head + "\n").utf8).write(to: d.appendingPathComponent("steps.jsonl"))
+            try Data(count: 100_000).write(to: d.appendingPathComponent("001.jpg"))
+        }
+        let removed = TraceStore.prune(root, keep: [], budget: 1)
+        XCTAssertEqual(removed, ["20261101-100000", "20261103-100000"], "A's older run and the run of no intent go")
     }
 }

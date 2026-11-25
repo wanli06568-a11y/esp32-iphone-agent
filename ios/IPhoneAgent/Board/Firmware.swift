@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-/// A board firmware release: `firmware.json` next to the image on handsy.tech (hardware/tools/fw_release.py). Signed with the project's Ed25519 key, so a changed release page
+/// A board firmware release: `firmware.json` next to the image on manina.ai (hardware/tools/fw_release.py). Signed with the project's Ed25519 key, so a changed release page
 /// or a hacked site can't put other code on the board.
 /// A firmware version like the repo's release tags: "0.2.0", shown as v0.2.0. Boards from before semver report
 /// a plain number n (OTA test builds 2 and 3), read as 0.0.n so any tagged release is newer.
@@ -26,11 +26,13 @@ struct FirmwareVersion: Codable, Comparable, CustomStringConvertible, Hashable {
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.singleValueContainer()
-        try c.encode(parts.map(String.init).joined(separator: "."))
+        try c.encode(plain)
     }
 
     static func < (a: Self, b: Self) -> Bool { a.parts.lexicographicallyPrecedes(b.parts) }
-    var description: String { "v" + parts.map(String.init).joined(separator: ".") }
+    var description: String { "v" + plain }
+    /// "0.2.5", without the v: what the gateway reads in a free-line run end (`fw`, RunEnd).
+    var plain: String { parts.map(String.init).joined(separator: ".") }
 }
 
 struct FirmwareRelease: Codable, Equatable {
@@ -41,23 +43,41 @@ struct FirmwareRelease: Codable, Equatable {
     var url: String     // the image, relative to the manifest
     var sig: String?    // base64 Ed25519 over `signed` (only a Debug harness build may come without, HarnessOTA.swift)
     var notes: String?
+    var min_app: String?  // the oldest app that may install it (an older one is asked to update itself first)
+    var target: String?   // another board's channel ("stopwatch"), signed with it; nil: the USB board's
 
     var ver: FirmwareVersion { FirmwareVersion(version) ?? FirmwareVersion([0]) }
-    var signed: Data { Data("esp32agent-firmware\nversion=\(version)\nsize=\(size)\nsha256=\(sha256)\nmd5=\(md5)".utf8) }
+    /// This app may install it: no `min_app`, or this app is that version or newer.
+    func fits(app: FirmwareVersion) -> Bool { min_app.flatMap(FirmwareVersion.init).map { app >= $0 } ?? true }
+    var signed: Data {
+        Data(("esp32agent-firmware\nversion=\(version)\nsize=\(size)\nsha256=\(sha256)\nmd5=\(md5)"
+              + (target.map { "\ntarget=\($0)" } ?? "")).utf8)
+    }
+    /// The channel it belongs to: a USB release carries no target.
+    var channel: String { target ?? Firmware.usbTarget }
 }
 
 enum Firmware {
-    /// Releases come from handsy.tech only: we control it, so test releases can be staged there too.
+    /// Releases come from our own site: manina.ai, else handsy.tech while the new domain is not served everywhere
+    /// (2026-11-18: manina.ai reset the connection from China; the old host still answers). Both lists carry the same signature.
     /// TestFlight builds (`fastlane beta testflight:true` sets TESTFLIGHT) read their own list, signed with the same key.
     #if TESTFLIGHT
-    static let sources = [URL(string: "https://handsy.tech/firmware/testflight/firmware.json")!]
+    static let sources = [URL(string: "https://manina.ai/firmware/testflight/firmware.json")!,
+                          URL(string: "https://handsy.tech/firmware/testflight/firmware.json")!]
     #else
-    static let sources = [URL(string: "https://handsy.tech/firmware/firmware.json")!]
+    static let sources = [URL(string: "https://manina.ai/firmware/firmware.json")!,
+                          URL(string: "https://handsy.tech/firmware/firmware.json")!]
     #endif
     /// The oldest board firmware this app works with; an older board gets the update before anything else.
     static let required = FirmwareVersion([0, 2, 0])
     /// The first firmware that takes updates over Wi-Fi; older boards need hardware/flash.sh over USB.
     static let firstOTA = FirmwareVersion([0, 0, 2])
+    /// The USB board's channel (its image marker ESPA:usb-8m): firmware.json at the sources. Other boards' releases
+    /// sit in a folder named after their target next to it (stopwatch/firmware.json), signed with the target.
+    static let usbTarget = "usb-8m"
+    static func sources(for target: String) -> [URL] {
+        target == usbTarget ? sources : sources.map { $0.deletingLastPathComponent().appendingPathComponent("\(target)/firmware.json") }
+    }
     static let publicKey = Data(base64Encoded: "DfqjOJal/fdCPhpWbNJv1q2OdszGMXxExGH1qTzmO8k=")!
     static let port: UInt16 = 7300
     /// Boards from before OTA don't report `fw`.
@@ -83,8 +103,10 @@ enum Firmware {
     }
 
     /// A copy placed in Documents/firmware (a test build, or a release saved earlier) comes first; it must be signed too.
-    static var local: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(localDir + "/firmware.json")
+    static var local: URL { folder(localDir).appendingPathComponent("firmware.json") }
+    /// Documents/<dir>; harness test builds (harness/fw.sh) sit in Documents/developer/harness-fw-<time>.
+    static func folder(_ dir: String) -> URL {
+        (dir.hasPrefix("harness-fw-") ? FilesLayout.developer : AgentFiles.root).appendingPathComponent(dir, isDirectory: true)
     }
     /// Debug `ota <dir>`: devicectl can't replace a file it copied before, so each test build gets a new folder.
     nonisolated(unsafe) static var localDir = "firmware"
@@ -96,18 +118,19 @@ enum Firmware {
     }
 
     /// The newest signed release among the sources, and where its manifest came from.
-    static func latest(session: URLSession = .shared) async throws -> (FirmwareRelease, URL) {
+    static func latest(for target: String = usbTarget, session: URLSession = .shared) async throws -> (FirmwareRelease, URL) {
         var found: [(FirmwareRelease, URL)] = []
         var lastError: Error?
-        if let data = try? Data(contentsOf: local), let r = signedRelease(data) { found.append((r, local)) }
-        for url in sources {
+        if let data = try? Data(contentsOf: local), let r = signedRelease(data), r.channel == target { found.append((r, local)) }
+        for url in sources(for: target) {
             do {
                 var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
                 request.setValue("ESP32Agent", forHTTPHeaderField: "User-Agent")
                 let (data, response) = try await session.data(for: request)
                 guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw Failure("HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)") }
                 let r = try JSONDecoder().decode(FirmwareRelease.self, from: data)
-                guard verify(r) else { throw Failure(String(localized: "The firmware release isn't signed by ESP32 Agent.")) }
+                guard verify(r) else { throw Failure(String(localized: "The firmware release isn't signed by \(AppName.current).")) }
+                guard r.channel == target else { throw Failure("a release for \(r.channel), not \(target)") }
                 found.append((r, response.url ?? url))
                 break  // the first source that answers is enough
             } catch {
@@ -123,7 +146,7 @@ enum Firmware {
 
     /// The image, from the cache when it was downloaded before; always checked against the signed manifest.
     static func image(_ r: FirmwareRelease, manifest: URL, session: URLSession = .shared) async throws -> Data {
-        let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("firmware-\(r.version).bin")
+        let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent(r.target.map { "firmware-\($0)-\(r.version).bin" } ?? "firmware-\(r.version).bin")
         if let data = try? Data(contentsOf: cache), matches(data, r) { return data }
         guard let url = URL(string: r.url, relativeTo: manifest)?.absoluteURL else { throw Failure("bad firmware url") }
         let data: Data
@@ -141,14 +164,23 @@ enum Firmware {
 
     /// Sends the image to the board over its Wi-Fi (TCP, ota.h). Returns when the board has checked and installed
     /// it and is restarting. A cut connection leaves the running firmware as it was.
-    static func push(_ image: Data, md5: String, host: String, token: String, port: UInt16 = port,
+    /// `proven`: the board has the LAN lock (LanAuth): the token is proven, not sent, and the board checks the
+    /// image against the SHA-256 the proof covers ("chal", then "ota2 <size> <sha256> <hmac>").
+    static func push(_ image: Data, md5: String, host: String, token: String, proven: Bool = false, port: UInt16 = port,
                      progress: @escaping @Sendable (Double) -> Void) async throws {
         try await Task.detached(priority: .userInitiated) {
-            try pushBlocking(image, md5: md5, host: host, token: token, port: port, progress: progress)
+            try pushBlocking(image, md5: md5, host: host, token: token, proven: proven, port: port, progress: progress)
         }.value
     }
 
-    private static func pushBlocking(_ image: Data, md5: String, host: String, token: String, port: UInt16,
+    /// The first line(s) of an update: the plain header, or the answer to the board's challenge.
+    static func header(_ image: Data, md5: String, token: String, nonce: String?) -> String {
+        guard let nonce else { return "ota \(token) \(image.count) \(md5)\n" }
+        let sha = hex(SHA256.hash(data: image))
+        return "ota2 \(image.count) \(sha) \(LanAuth.ota(token: token, nonce: nonce, size: image.count, sha256: sha))\n"
+    }
+
+    private static func pushBlocking(_ image: Data, md5: String, host: String, token: String, proven: Bool, port: UInt16,
                                      progress: @Sendable (Double) -> Void) throws {
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { throw Failure("socket() failed, errno \(errno)") }
@@ -166,7 +198,14 @@ enum Firmware {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
         guard connected == 0 else { throw Failure(String(localized: "Can't reach the board over Wi-Fi. Put the iPhone on the board's Wi-Fi (or the network the board joined) and try again.")) }
-        try sendAll(fd, Data("ota \(token) \(image.count) \(md5)\n".utf8))
+        var nonce: String?
+        if proven {
+            try sendAll(fd, Data("chal\n".utf8))
+            let chal = try readLine(fd)
+            guard chal.hasPrefix("chal "), chal.count == 37 else { throw Failure(answer(chal)) }
+            nonce = String(chal.dropFirst(5))
+        }
+        try sendAll(fd, Data(header(image, md5: md5, token: token, nonce: nonce).utf8))
         let head = try readLine(fd)
         guard head == "ok" else { throw Failure(answer(head)) }
         let chunk = 16 * 1024

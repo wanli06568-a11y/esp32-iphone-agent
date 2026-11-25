@@ -9,7 +9,8 @@ struct JevStepInput: Equatable {
     static func parse(_ text: String, image: Data?) -> JevStepInput? {
         guard let image, image.starts(with: [0xff, 0xd8]),
               let goal = first(#"Goal:\s*(.*)"#, text), !goal.isEmpty,
-              let plan = first(#"\n\nPlan:\n(.*?)\n\nRecent actions:\n"#, text, dotAll: true), !plan.isEmpty
+              let plan = first(#"\n\nPlan:\n(.*?)\n\nRecent actions:\n"#, text, dotAll: true),
+              !JevRules.planSteps(plan).isEmpty  // no numbered plan yet: Jev could only say no_plan
         else { return nil }
         let history = first(#"\n\nRecent actions:\n(.*?)(?:\n\n|$)"#, text, dotAll: true)
         return JevStepInput(goal: String(goal.prefix(2000)), plan: String(plan.prefix(4000)),
@@ -35,6 +36,21 @@ struct JevAnswer: Decodable, Equatable {
     /// Jev moves; it never ends a run (a "done" goes to the model, which alone decides the goal is reached).
     var taken: Bool { accept && !(self.do ?? "").isEmpty && !ends }
     var ends: Bool { (self.do ?? "").lowercased().hasPrefix("done") }
+
+    /// A refusal on the user's side (their region, their own TypeSafe key): told to the user once, and Jev is
+    /// skipped for the rest of the run. Not an outage, so no breaker and no silent fallback.
+    var userSideMessage: String? {
+        switch reason {
+        case "region_blocked":
+            return String(localized: "Jev isn't available in your region, so your model takes every step of this run.")
+        case "key_invalid":
+            return String(localized: "TypeSafe refused your Jev key. Check it in Settings; your model takes every step of this run.")
+        case "no_credit":
+            return String(localized: "Your TypeSafe account is out of credit, so your model takes every step of this run.")
+        default:
+            return nil
+        }
+    }
 }
 
 @MainActor protocol JevStepping: AnyObject {
@@ -67,6 +83,7 @@ struct JevAnswer: Decodable, Equatable {
             "ticket": try await ticket(), "request_id": UUID().uuidString.lowercased(), "run_id": runID,
             "goal": input.goal, "plan": input.plan, "image": "data:image/jpeg;base64," + input.image.base64EncodedString(),
             "app_version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+            "threshold": JevConfig.threshold,
         ]
         if let history = input.history { body["history"] = history }
         var request = URLRequest(url: url)
@@ -89,6 +106,10 @@ struct JevAnswer: Decodable, Equatable {
     let mode: Deciders.Mode
     let race: Bool
     let jevBreaker = Breaker("jev"), modelBreaker = Breaker("model")
+    /// Set by the run: shows a message to the user (a refusal on their side, see JevAnswer.userSideMessage).
+    var onNotice: ((String) -> Void)?
+    /// The user-side reason Jev was turned off for this run, if any.
+    private(set) var userBlock: String?
     var model: String { inner.model }
     var onProgress: ((ModelResponseProgress) -> Void)? {
         get { (inner as? ModelProgressReporting)?.onProgress }
@@ -173,9 +194,19 @@ struct JevAnswer: Decodable, Equatable {
 
     /// Jev's answer when it takes the step; nil when it is unsure, out or cancelled.
     private func askJev(_ input: JevStepInput, breaker: Bool = true) async -> JevAnswer? {
+        if userBlock != nil { return nil }
         if breaker, !jevBreaker.allow() { return nil }
         do {
             let answer = try await jev.step(input)
+            if let message = answer.userSideMessage {
+                if breaker { jevBreaker.release() }
+                if userBlock == nil {
+                    userBlock = answer.reason
+                    DebugLog.write("jev: off for this run (\(answer.reason ?? ""))")
+                    onNotice?(message)
+                }
+                return nil
+            }
             if answer.reason == "unavailable" {  // its own upstream is down: a failure, not an answer
                 if breaker { jevBreaker.record(ok: false) }
                 return nil

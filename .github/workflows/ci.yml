@@ -15,6 +15,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Store-only sources never belong in this repository (scripts/check-public.sh).
+  public:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-public.sh
+
   # PRs only run the jobs whose inputs changed. Skipping is done with `if:` (not on.paths) so the
   # required checks `ios` / `firmware` still report "skipped" = success instead of staying pending.
   # Branch pushes run everything.
@@ -51,13 +59,18 @@ jobs:
     if: needs.changes.outputs.ios == 'true'
     runs-on: macos-26
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [iPhone, iPad]  # the app runs on both; the iPad runs the unit tests only
     defaults:
       run:
         working-directory: ios
     env:
       # PRs: unit tests only. The UI tests (IntentFlowTests) take ~5.5 min and are the flaky part;
       # they still run on every push to main / release-1.0.
-      ONLY_TESTING: ${{ github.event_name == 'pull_request' && '-only-testing:IPhoneAgentTests' || '' }}
+      ONLY_TESTING: ${{ (github.event_name == 'pull_request' || matrix.device == 'iPad') && '-only-testing:IPhoneAgentTests' || '' }}
+      DEVICE: ${{ matrix.device }}
     steps:
       - uses: actions/checkout@v5
       - name: Pick simulator
@@ -69,7 +82,7 @@ jobs:
           sdk = os.environ["SDK"].replace(".", "-")
           rts = sorted((k for k in devs if ".iOS-" in k), key=lambda k: (not k.endswith("iOS-" + sdk), k))
           for rt in rts:
-              phones = [d for d in devs[rt] if d["name"].startswith("iPhone")]
+              phones = [d for d in devs[rt] if d["name"].startswith(os.environ["DEVICE"] + " ")]
               phones.sort(key=lambda d: "Pro" not in d["name"])
               if phones:
                   print(phones[0]["udid"]); print(phones[0]["name"], rt, file=sys.stderr); break
@@ -101,12 +114,21 @@ jobs:
           arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core install esp32:esp32@3.3.12 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli lib install "NimBLE-Arduino@2.5.1"
+          arduino-cli lib install --no-deps "M5Unified@0.2.29" "M5GFX@0.2.36"  # --stopwatch; 0.3.0 changed the rotation
       - name: Build
-        run: hardware/flash.sh --build-only
+        run: |
+          hardware/flash.sh --build-only
+          hardware/flash.sh --ble-hid --build-only
+          hardware/flash.sh --note4 --build-only
+          hardware/flash.sh --dual-hid --build-only
+          hardware/flash.sh --stopwatch --build-only
+          python3 hardware/tests/test_build_targets.py --built-images
+      - name: Build (absolute mouse)
+        run: hardware/flash.sh --abs --build-only
       - name: Host tests (bplist, GOP buffer, CLI protocol, Bonjour TXT, …)
         run: |
           sudo apt-get install -y libmbedtls-dev
-          make -C hardware/tests
+          make -C hardware/tests test check-hid
 
   server:  # legacy v0.1.0 architecture, kept working
     needs: changes

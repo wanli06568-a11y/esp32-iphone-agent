@@ -13,7 +13,7 @@ struct ListenSection: View {
     var body: some View {
         Section {
             Toggle(isOn: $listen) { SettingsLabel(title: "Listen to phone audio", symbol: "waveform", color: .mint) }
-                .onChange(of: listen) { _, on in app.setListening(on) }
+                .onValueChange(of: listen) { _, on in app.setListening(on) }
             if listen {
                 // English is always recognized; the second language is the other one the phone may play
                 Picker("Second language", selection: $second) {
@@ -22,12 +22,12 @@ struct ListenSection: View {
                     ForEach(choices, id: \.self) { Text(verbatim: SpeechLanguages.name($0)).tag($0) }
                 }
                 .onAppear { if choices.isEmpty { choices = SpeechLanguages.choices() } }
-                .onChange(of: second) { _, id in
+                .onValueChange(of: second) { _, id in
                     UserDefaults.standard.set(id, forKey: SpeechLanguages.key)
                     app.audio.reset()
                 }
                 Toggle("Share with the computer (CLI)", isOn: $share)
-                    .onChange(of: share) { _, _ in app.shareHearing() }
+                    .onValueChange(of: share) { _, _ in app.shareHearing() }
             }
         } footer: {
             footer
@@ -36,7 +36,7 @@ struct ListenSection: View {
 
     private var footer: Text {
         switch listen ? audio.state : nil {
-        case .denied?: return Text("Speech recognition is off for ESP32 Agent. Turn it on in Settings › ESP32 Agent.")
+        case .denied?: return Text("Speech recognition is off for \(AppName.current). Turn it on in Settings › \(AppName.current).")
         case .unavailable(let why)?: return Text(verbatim: why)  // already localized
         default: return Text("While the screen is mirrored, the agent also hears sound from the phone, such as a video or a call. Speech in English and the second language is turned into text on this iPhone.")
         }

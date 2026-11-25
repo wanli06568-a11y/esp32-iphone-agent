@@ -5,8 +5,8 @@ struct AboutView: View {
     @ObservedObject var app: AppModel
     static let repo = URL(string: "https://github.com/onehumanbeing/esp32-iphone-agent")!
     static let author = URL(string: "https://x.com/iamhenryyuan")!
-    static let website = URL(string: "https://handsy.tech")!
-    static let privacyPolicy = URL(string: "https://handsy.tech/privacy")!
+    static let website = URL(string: "https://manina.ai")!
+    static let privacyPolicy = URL(string: "https://manina.ai/privacy")!
 
     private var version: String {
         let info = Bundle.main.infoDictionary
@@ -31,7 +31,7 @@ struct AboutView: View {
         **Steps**
         1.
 
-        ESP32 Agent \(version) · board \(firmware ?? "not connected") · \(device.systemName) \(device.systemVersion) · \(DeviceInfo.model)
+        \(AppName.current) \(version) · board \(firmware ?? "not connected") · \(device.systemName) \(device.systemVersion) · \(DeviceInfo.model)
         (Attach the zip from Settings › About › Logs › Export all logs.)
         """
         var c = URLComponents(url: Self.repo.appendingPathComponent("issues/new"), resolvingAgainstBaseURL: false)!
@@ -45,7 +45,7 @@ struct AboutView: View {
                 VStack(spacing: Space.m) {
                     Image("Logo").resizable().scaledToFit().frame(width: 96, height: 96)
                         .accessibilityHidden(true)
-                    Text(verbatim: "ESP32 Agent").font(.title2.bold())
+                    Text(verbatim: AppName.current).font(.title2.bold())
                     Text("Version \(version)").font(.subheadline).foregroundStyle(.secondary)
                     if let firmware {
                         Text("Board firmware \(firmware)").font(.subheadline).foregroundStyle(.secondary)
@@ -256,7 +256,8 @@ struct LogsView: View {
         Task {
             if let log = await BoardLogDump.read(app.board.commands) {  // the board's RAM log goes in the zip too
                 let crash = await BoardLogDump.crash(app.board.commands) ?? ""
-                try? ("crash: \(crash)\n\n" + log).write(to: docs.appendingPathComponent("board.log"), atomically: true, encoding: .utf8)
+                try? ("crash: \(crash)\n\n" + log).write(to: FilesLayout.logs.appendingPathComponent("board.log"),
+                                                          atomically: true, encoding: .utf8)
             }
             let result = await Task.detached { Result { try TraceStore.zip(docs, name: "esp32-agent-logs.zip") } }.value
             exporting = false

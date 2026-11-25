@@ -4,11 +4,93 @@ import WidgetKit
 
 /// Siri, Shortcuts, widgets and controls → the app; and the app's state → the widgets (App Group snapshot).
 extension AppModel {
+    /// The waiting island's intents (the most run, filled in, at most 3); nil while standby is off or something runs.
+    var standbyPicks: [StandbyPick]? {
+        guard settings.standbyIsland, !agent.running, !startingAgent, !recorder.busy else { return nil }
+        return intents.items.filter { !$0.unfilled && $0.builtin == nil }.sorted { $0.runs.count > $1.runs.count }
+            .prefix(3).map { StandbyPick(id: $0.id, name: $0.name, symbol: $0.symbol) }
+    }
+
+    /// Standby on and nothing running: the island waits (started from the foreground, kept up to date after).
+    func refreshStandby() {
+        if let picks = standbyPicks { live.standby(picks) }
+        else if !settings.standbyIsland { live.endStandby() }
+    }
+
+    /// An M5Stack StopWatch shows the Live Activity's state and its buttons drive the run (StopWatchUI).
+    func wireStopWatch() {
+        // No run (nil): the app's own mood, idle, so the board's character is awake while the app is there.
+        live.onBoard = { [weak self] state in self?.board.commands.showUI(state ?? StopWatchUI.idle) }
+        board.commands.onButton = { [weak self] action in self?.stopWatchButton(action) }
+        voice.onResult = { [weak self] result in self?.board.commands.sendVoice(result) }
+        // the newest intents first (IntentStore inserts at the top), ready to run
+        board.commands.quickIntents = { [weak self] in
+            (self?.intents.items ?? []).filter { !$0.unfilled && $0.builtin == nil }
+                .map { StandbyPick(id: $0.id, name: $0.name, symbol: $0.symbol) }
+        }
+    }
+
+    func stopWatchButton(_ action: StopWatchUI.Action) {
+        let idle = !agent.running && !startingAgent && !recorder.busy && !calibrator.busy
+        switch action {
+        case .command(let command):
+            Task { await control(command) }
+        case .home:
+            // Only while nothing else drives the pointer; mid-run the agent decides where it goes.
+            guard idle, board.connected, pointer.calibrated else {
+                return DebugLog.write("stopwatch: home ignored (busy or not calibrated)")
+            }
+            Task {
+                do { try await pointer.goHome() } catch { DebugLog.write("stopwatch: home failed: \(error.localizedDescription)") }
+            }
+        case .run(let id):
+            guard idle, intents.item(id) != nil else { return DebugLog.write("stopwatch: run ignored (busy or intent gone)") }
+            Task { _ = await handle(.runSaved(id)) }
+        case .voice(let go):
+            guard go else { return voice.cancel() }
+            guard let text = voice.take() else { return board.commands.sendVoice(.failed("none")) }
+            Task { await runSpoken(text) }
+        }
+    }
+
+    /// Words said into the StopWatch: they join the running task (as Siri's do), else they start a new one.
+    private func runSpoken(_ text: String) async {
+        if agent.running {
+            if !steer(text, from: "stopwatch") { board.commands.sendVoice(.failed("start")) }
+            return
+        }
+        guard !startingAgent, !recorder.busy, !calibrator.busy else { return board.commands.sendVoice(.failed("start")) }
+        let said = await runFromIntent(text, intent: nil)
+        if !agent.running {
+            DebugLog.write("stopwatch: voice task did not start: \(said)")
+            board.commands.sendVoice(.failed("start"))
+        }
+    }
+
+    /// A task from the quick sheet (the island's New Task): it runs on the screen the user came from.
+    func runHere(_ task: String, intent: SavedTask?) async {
+        if !appIsBackgrounded, board.connected, pointer.calibrated, await backToPrevious() {
+            DebugLog.write("quick task: runs on the app the user came from")
+        }
+        await run(task, intent: intent)
+    }
+
+    /// The first hint of a run started while another app was in front.
+    nonisolated static let hereHint = "The run starts on the screen the user had open when they asked; the task is " +
+        "about it. Work from this screen; do not go to the Home Screen first."
+
+    /// Words added to the running task (AgentLoop.steer). `from`: home, quick, siri (usage stats get only that).
+    @discardableResult func steer(_ text: String, from: String) -> Bool {
+        guard agent.steer(text) else { return false }
+        Analytics.capture("steer_added", ["source": from, "queued": agent.steering.count])
+        return true
+    }
+
     func handle(_ request: AgentRequest) async -> String {
         DebugLog.write("intent: \(request)")
         switch request {
-        case .runTask(let task):
-            return await runFromIntent(task, intent: nil)
+        case .runTask(let task, let unattended):
+            return await runFromIntent(task, intent: nil, unattended: unattended)
         case .runSaved(let id):
             let saved = id.flatMap { intents.item($0) } ?? intents.item(widgetSnapshot?.lastIntent) ?? intents.items.first
             guard let saved else { return String(localized: "There are no saved intents yet.") }
@@ -25,22 +107,28 @@ extension AppModel {
             guard let run = runs.run(id) else { return String(localized: "That run isn't on this iPhone any more.") }
             openReview(run: run.id)
             return String(localized: "Showing the run: \(run.task)")
+        case .quickAsk:
+            quickAsk = true
+            return ""
         }
     }
 
     /// Checks what a run needs before starting it from outside the app (no screen to fix things on).
-    private func runFromIntent(_ task: String, intent: SavedTask?) async -> String {
+    private func runFromIntent(_ task: String, intent: SavedTask?, unattended: Bool = false) async -> String {
         let task = task.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !task.isEmpty else { return String(localized: "The task is empty.") }
-        if agent.running { return String(localized: "Already running: \(agent.task)") }
+        if agent.running {  // Henry 2026-11-13: words said while a run goes join it
+            return steer(task, from: "siri") ? String(localized: "Added to the running task: \(task)")
+                : String(localized: "Already running: \(agent.task)")
+        }
         if !MockMode.on {
             guard settings.isConfigured else { return String(localized: "Set up the model in Settings first.") }
-            guard pointer.calibrated else { return String(localized: "Calibrate the pointer in ESP32 Agent first.") }
+            guard pointer.calibrated else { return String(localized: "Calibrate the pointer in \(AppName.current) first.") }
             guard await waitReady(mirroring: true, timeout: 20) else {
                 return String(localized: "The board or Screen Mirroring isn't ready. Connect the board and start Screen Mirroring.")
             }
         }
-        await run(task, intent: intent)
+        await run(task, intent: intent, unattended: unattended)
         publishWidget()
         if agent.running { return String(localized: "Started: \(task)") }
         return String(localized: "Could not start: \(log.last?.text ?? "")")

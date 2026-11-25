@@ -3,8 +3,9 @@
 English · [简体中文](README.zh-CN.md)
 
 Command line and MCP server that let a computer (and the coding agent on it: Claude Code, Codex) see and drive an
-iPhone through an ESP32 Agent board. The board is plugged into the iPhone as its USB mouse and keyboard and receives
-its AirPlay screen mirroring; the computer reaches it over Bluetooth, or over Wi-Fi when both are on the same network, next to the iOS app. Commands and JSON output
+iPhone through an ESP32 Agent board. The board is the iPhone's mouse and keyboard, plugged into it over USB or, in
+Bluetooth mode, paired as its Bluetooth mouse and keyboard (any USB power will do), and receives its AirPlay screen
+mirroring; the computer reaches it over Bluetooth, or over Wi-Fi when both are on the same network, next to the iOS app. Commands and JSON output
 follow [mobilecli](https://github.com/mobile-next/mobilecli).
 
 ## Install
@@ -14,13 +15,15 @@ curl -fsSL https://raw.githubusercontent.com/onehumanbeing/esp32-iphone-agent/ma
 ```
 
 Windows (PowerShell): `irm https://raw.githubusercontent.com/onehumanbeing/esp32-iphone-agent/main/cli/install/install.ps1 | iex`.
-npm: `npm install -g esp32agent`. The scripts read the release list at `https://handsy.tech/cli/versions.json`
+npm: `npm install -g esp32agent`. The scripts read the release list at `https://manina.ai/cli/versions.json`
 (falling back to GitHub Releases) and check the archive's SHA-256. Screenshots need `ffmpeg` (the installers offer
 brew / apt / dnf / winget). Later: `esp32agent upgrade`.
 
 ## Pair
 
-1. Plug the board into the iPhone. Within 3 minutes: `esp32agent pair`.
+1. Power the board (USB mode: plug it into the iPhone). Within 3 minutes of it powering up: `esp32agent pair`.
+   In Bluetooth mode, pair the board on the iPhone in the same window (Settings > Accessibility > Touch >
+   AssistiveTouch > Devices > Bluetooth Devices).
 2. On the iPhone: Control Center > Screen Mirroring > ESP32 Agent.
 3. `esp32agent screenshot` should now write a PNG of the phone's screen.
 
@@ -56,8 +59,12 @@ never by the OS, so stale Bluetooth bonds don't matter. Keys live in the user co
 | `intent list`, `intent show NAME\|ID` | saved intents |
 | `intent save --name N --prompt P [--hint H ...] [--from-run RUN [--steps 1,3,4]]` | save an intent; steps are the run's replayable moves (all, or the numbers from `history show`) |
 | `intent delete NAME\|ID` | |
-| `intent export NAME\|ID... [--screenshots] [--output FILE]` | `.esp32intent` file the iOS app imports; reference screens only with `--screenshots` |
-| `intent import FILE` | an `.esp32intent` file (from the app or `export`); ones already saved under the same name and prompt are skipped |
+| `intent export NAME\|ID... [--screenshots] [--output FILE]` | `.intent` file the iOS app imports; reference screens only with `--screenshots` |
+| `intent import FILE` | an `.intent` file (from the app or `export`); ones already saved under the same name and prompt are skipped |
+| `memory list`, `memory search TEXT [--limit N]` | what the agent remembers, the most related first |
+| `memory add TEXT [--kind preference\|fact\|app] [--topic APP]` | remember one line; passwords, codes and card or ID numbers are refused |
+| `memory rm ID` | |
+| `memory export [--output FILE]`, `memory import FILE` | the app's `MEMORY.md`; on import an entry with the same id or words keeps the newer one |
 | `report --intent NAME [--screenshots]` | prepare a mail with one intent for the developer (see below); interactive |
 | `upgrade [--check] [--force]` | install the latest release (`--check`: `current`, `latest`, `update_available`) |
 | `mcp` | MCP server on stdio |
@@ -81,7 +88,7 @@ esp32agent skill install                         # Claude Code skill (the loop, 
 ```
 
 MCP tools: `screenshot` (returns the image), `tap`, `longpress`, `swipe`, `type_text`, `press_key`, `press_button`,
-`device_info`, and `history`, `intent_list`, `intent_show`, `intent_save`. The loop is screenshot, decide, one action,
+`device_info`, and `history`, `intent_list`, `intent_show`, `intent_save`, `memory_recall`, `memory_add`. The loop is screenshot, decide, one action,
 screenshot: see [SKILL.md](SKILL.md).
 
 ## History and intents
@@ -92,17 +99,24 @@ idle or with `history new`; the newest 100 are kept. Nothing leaves the computer
 
 An intent is a saved task: name, prompt, up to 6 hints and recorded steps with their screens (`intents.json` and
 `intent-frames/<id>/` in the config dir, the app's fields). `intent save --from-run RUN` takes the run's replayable
-moves (tap, swipe, type, key, home). `intent export` and `intent import` use the app's `.esp32intent` format, so
+moves (tap, swipe, type, key, home). `intent export` and `intent import` use the app's `.intent` format, so
 intents move between the CLI and the iPhone app (AirDrop or Files).
+
+## Memory
+
+The iOS app keeps what the user told it (preferences, facts, how an app works) in `MEMORY.md`, one entry per
+line under a dated header. The CLI keeps the same file in `memory/MEMORY.md` in the config dir. To move it: in the
+app, Settings › Memory › ⋯ › Export MEMORY.md (AirDrop or Files), then `esp32agent memory import FILE`; the other
+way, `esp32agent memory export` and Settings › Memory › ⋯ › Import. Nothing is synced through a server.
 
 ## Share an intent with the developer (optional)
 
 `esp32agent report --intent NAME [--screenshots]` helps improve intents for everyone. It only runs in a terminal
-you type in (agents can't call it, and there is no MCP tool for it). It writes a redacted `.esp32intent` to a temp
+you type in (agents can't call it, and there is no MCP tool for it). It writes a redacted `.intent` to a temp
 folder: typed text becomes `•••`, IP addresses are removed, and with `--screenshots` each screen gets the top 7%
 (status bar, notifications) blacked out and is shrunk to 480 px wide; other text on the screens stays readable.
 It prints exactly what the file holds (name, prompt, hints, step count, screenshots, path) and continues only when
-you type `y`: then it opens a mail to `intents@handsy.tech` in your mail app and shows the file. Attach it and send
+you type `y`: then it opens a mail to `intents@manina.ai` in your mail app and shows the file. Attach it and send
 it yourself; esp32agent never sends anything.
 
 ## Limits
@@ -127,6 +141,6 @@ ESP32AGENT_SIM=$PWD/hardware/tests/sim/cli_sim esp32agent screenshot   # the CLI
 
 Release: push a tag `cli-vX.Y.Z`; `.github/workflows/cli.yml` builds darwin (cgo, CoreBluetooth), linux and
 windows (pure Go) for amd64/arm64 and uploads the archives with `checksums.txt`. It also leaves a `versions.json`
-artifact ([format](install/versions.example.json)); merging it into `https://handsy.tech/cli/versions.json` is
+artifact ([format](install/versions.example.json)); merging it into `https://manina.ai/cli/versions.json` is
 manual. `ESP32AGENT_VERSIONS_URL` points `upgrade` and the installers at another list (tests). Installer testing:
 `ESP32AGENT_ARCHIVE=/path/esp32agent_darwin_arm64.tar.gz sh cli/install/install.sh` (checksums.txt next to it).

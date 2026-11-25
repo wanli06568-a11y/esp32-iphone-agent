@@ -1,3 +1,4 @@
+import ImageIO
 import CoreVideo
 import XCTest
 @testable import IPhoneAgent
@@ -320,6 +321,54 @@ final class VideoReorderTests: XCTestCase {
 }
 
 @MainActor final class StillScreenTests: XCTestCase {
+    override func setUp() async throws { StepWaits.reset(); StepWaits.lastMoving = -1000 }
+    override func tearDown() async throws { StepWaits.reset(); StepWaits.lastMoving = -1000 }
+
+    /// A screen that changes on every frame (a video playing): one full wait per step, then short ones.
+    func testMovingScreenWaitsInFullOncePerStep() async {
+        let screen = FakeStillScreen()
+        let feeding = Task { while !Task.isCancelled { screen.changed = now(); try? await Task.sleep(nanoseconds: 50_000_000) } }
+        defer { feeding.cancel() }
+        var start = now()
+        await screen.settled(quiet: 0.5, least: 0.3, most: 3)
+        XCTAssertGreaterThan(now() - start, 2.9)
+        XCTAssertTrue(StepWaits.moving)
+        start = now()
+        await screen.settled()
+        await screen.settled(quiet: 0.5, least: 1.0, most: 4)
+        XCTAssertLessThan(now() - start, 2 * StepWaits.movingCap + 0.5)
+        XCTAssertGreaterThan(StepWaits.settle, 3.5)
+        StepWaits.reset()  // the next step: the screen was moving a moment ago, so its first wait is shorter
+        start = now()
+        await screen.settled(quiet: 0.5, least: 0.3, most: 3)
+        XCTAssertEqual(now() - start, StepWaits.recentCap, accuracy: 0.4)
+        XCTAssertTrue(StepWaits.moving, "and the later waits of that step are short again")
+        StepWaits.reset()
+        StepWaits.lastMoving = -1000  // long after: a full wait again
+        start = now()
+        await screen.settled(quiet: 0.5, least: 0.3, most: 3)
+        XCTAssertGreaterThan(now() - start, 2.9)
+    }
+
+    /// A short wait that runs out (the pointer's own small caps) says nothing about the screen.
+    func testShortTimeoutDoesNotCapLaterWaits() async {
+        let screen = FakeStillScreen()
+        let feeding = Task { while !Task.isCancelled { screen.changed = now(); try? await Task.sleep(nanoseconds: 50_000_000) } }
+        await screen.settled(quiet: 0.5, least: 0.3, most: 1)
+        feeding.cancel()
+        XCTAssertFalse(StepWaits.moving)
+    }
+
+    /// A screen that goes still is not capped: it settles as before, and a still one stays quick.
+    func testSettlingScreenIsNotMarkedMoving() async {
+        let screen = FakeStillScreen()
+        screen.changed = now()
+        let start = now()
+        await screen.settled()
+        XCTAssertLessThan(now() - start, 1.5)
+        XCTAssertFalse(StepWaits.moving)
+    }
+
     /// AirPlay repeats a still screen: the same image again must not count as a change, or `settled` never ends.
     func testRepeatedImageDoesNotCountAsAChange() async throws {
         let feed = VideoFeed()
@@ -407,5 +456,87 @@ final class VideoReorderTests: XCTestCase {
         XCTAssertEqual(units.map(\.config), [true, false, false])
         XCTAssertEqual(units[1].data, Data(t.idr))
         XCTAssertEqual(a.drops, 0)
+    }
+}
+
+/// The model's copy: an iPhone's exactly as before (540 px wide); an iPad's within a pixel budget, untouched below it.
+final class ModelImageTests: XCTestCase {
+    func testIPhoneCopyIs540Wide() throws {
+        XCTAssertEqual(try Self.shrunk(718, 1560, nil)[0], 540, accuracy: 1)
+        XCTAssertEqual(try Self.shrunk(1080, 750, nil), [540, 375], "the width cap that left a landscape iPad unreadable")
+    }
+
+    func testIPadCopyKeepsAPixelBudget() throws {
+        let pad = ModelImage.padPixels
+        for (w, h) in [(1200, 834), (834, 1200), (1440, 1000)] {
+            let out = try Self.shrunk(w, h, pad)
+            XCTAssertLessThanOrEqual(out[0] * out[1], pad + 2000, "\(w)x\(h)")
+            XCTAssertGreaterThan(out[0] * out[1], pad * 95 / 100, "\(w)x\(h)")
+            XCTAssertEqual(Double(out[0]) / Double(out[1]), Double(w) / Double(h), accuracy: 0.01)
+        }
+        XCTAssertLessThan(Double(pad), 1.2 * 540 * 1170, "about an iPhone's 540x1170, not much more")
+        let stream = try Self.jpeg(720, 500)
+        XCTAssertEqual(ModelImage.shrink(stream, maxPixels: pad), stream, "within the budget: no second JPEG pass")
+    }
+
+    static func shrunk(_ w: Int, _ h: Int, _ budget: Int?) throws -> [Int] {
+        let small = ModelImage.shrink(try jpeg(w, h), maxPixels: budget)
+        let src = try XCTUnwrap(CGImageSourceCreateWithData(small as CFData, nil))
+        let props = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any])
+        return [try XCTUnwrap(props[kCGImagePropertyPixelWidth] as? Int), try XCTUnwrap(props[kCGImagePropertyPixelHeight] as? Int)]
+    }
+
+    static func jpeg(_ w: Int, _ h: Int) throws -> Data {
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        for i in 0..<40 {  // detail, so the smaller copy is smaller in bytes too and gets used
+            ctx.setFillColor(red: CGFloat(i % 7) / 7, green: CGFloat(i % 5) / 5, blue: CGFloat(i % 3) / 3, alpha: 1)
+            ctx.fill(CGRect(x: (i * 37) % w, y: (i * 53) % h, width: w / 5, height: h / 9))
+        }
+        let out = NSMutableData()
+        let dest = try XCTUnwrap(CGImageDestinationCreateWithData(out, "public.jpeg" as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, try XCTUnwrap(ctx.makeImage()), [kCGImageDestinationLossyCompressionQuality: 1.0] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+        return out as Data
+    }
+}
+
+/// The `vdiag` line: one per 5 s window while a run goes, counts from zero each window (BLE vs USB HID freezes).
+final class VideoDiagTests: XCTestCase {
+    func testOneLinePerWindowWithItsOwnCounts() {
+        var d = VideoDiag()
+        XCTAssertNil(d.tick(at: 100, active: true, hid: "ble", via: "wifi", frozen: false), "the first tick opens the window")
+        d.units += 3
+        d.seqDrops += 2
+        d.shown(at: 101)
+        d.shown(at: 101.2)
+        d.shown(at: 103.7)
+        d.decodeError()
+        d.sessionLost()
+        XCTAssertNil(d.tick(at: 104, active: true, hid: "ble", via: "wifi", frozen: false))
+        XCTAssertEqual(d.tick(at: 105, active: true, hid: "ble", via: "wifi", frozen: true),
+                       "vdiag: hid ble via wifi, 5 s: units 3, frames 3, max frame gap 2.5 s, frame age 1.3 s, seq drops 2, decode errors 1, session lost 1, fz 1")
+        // nothing shown in the next window: the gap is the frame's age, the counts start over
+        XCTAssertEqual(d.tick(at: 110, active: true, hid: "usb", via: "ble", frozen: false),
+                       "vdiag: hid usb via ble, 5 s: units 0, frames 0, max frame gap 6.3 s, frame age 6.3 s, seq drops 0, decode errors 0, session lost 0, fz 0")
+    }
+
+    func testNoLineWithoutARunAndNoFrameYet() {
+        var d = VideoDiag()
+        XCTAssertNil(d.tick(at: 0, active: false, hid: "ble", via: "wifi", frozen: false))
+        XCTAssertNil(d.tick(at: 10, active: false, hid: "ble", via: "wifi", frozen: false))
+        XCTAssertNil(d.tick(at: 20, active: true, hid: "ble", via: "wifi", frozen: false))
+        XCTAssertEqual(d.tick(at: 26, active: true, hid: "ble", via: "wifi", frozen: false),
+                       "vdiag: hid ble via wifi, 6 s: units 0, frames 0, max frame gap 6.0 s, frame age -, seq drops 0, decode errors 0, session lost 0, fz 0")
+        XCTAssertNil(d.tick(at: 27, active: false, hid: "ble", via: "wifi", frozen: false), "the run ended")
+        XCTAssertNil(d.tick(at: 40, active: true, hid: "ble", via: "wifi", frozen: false), "a new run opens a new window")
+    }
+
+    func testHIDTransportFromStatus() throws {
+        XCTAssertEqual(try XCTUnwrap(BoardStatus.decode(Data(#"{"usb":"ok"}"#.utf8))).hidTransport, "usb")
+        XCTAssertEqual(try XCTUnwrap(BoardStatus.decode(Data(#"{"hid":"ok","usb":"off"}"#.utf8))).hidTransport, "ble")
+        XCTAssertEqual(try XCTUnwrap(BoardStatus.decode(Data(#"{"hidm":"usb","usb":"ok"}"#.utf8))).hidTransport, "usb")
+        XCTAssertEqual(try XCTUnwrap(BoardStatus.decode(Data(#"{"hidm":"ble","hid":"ok"}"#.utf8))).hidTransport, "ble")
     }
 }

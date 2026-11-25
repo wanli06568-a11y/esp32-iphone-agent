@@ -26,9 +26,9 @@ struct AgentStatusWidget: Widget {
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: SharedState.kind, provider: AgentProvider()) { entry in
             AgentWidgetView(entry: entry)
-                .containerBackground(.fill.tertiary, for: .widget)
+                .widgetBackground()
         }
-        .configurationDisplayName("ESP32 Agent")
+        .configurationDisplayName(AppName.current)
         .description("See whether the agent is ready and run your saved intents.")
         .supportedFamilies([.systemSmall, .systemMedium, .accessoryCircular, .accessoryRectangular])
     }
@@ -67,7 +67,7 @@ struct AgentWidgetView: View {
         VStack(alignment: .leading, spacing: 6) {
             face.frame(width: 52, height: 58)
             Spacer(minLength: 0)
-            Text(verbatim: "ESP32 Agent").font(.caption).foregroundStyle(.secondary)
+            Text(verbatim: AppName.current).font(.caption).foregroundStyle(.secondary)
             statusText.font(.headline).lineLimit(1).minimumScaleFactor(0.8)
             if snap.status == .running {
                 Text(verbatim: snap.task).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
@@ -90,7 +90,7 @@ struct AgentWidgetView: View {
             } else {
                 VStack(spacing: 6) {
                     ForEach(snap.intents.prefix(4)) { item in
-                        Button(intent: RunSavedIntentIntent(intent: SavedIntentEntity(item))) {
+                        IntentButton(intent: RunSavedIntentIntent(intent: SavedIntentEntity(item)), fallback: AgentActivityAttributes.quickURL) {
                             Label { Text(verbatim: item.name).lineLimit(1) } icon: { Image(systemName: item.symbol) }
                                 .font(.caption.weight(.medium))
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -125,7 +125,7 @@ struct AgentWidgetView: View {
                 Text(verbatim: run.task).font(.caption).lineLimit(1)
                 Text(run.date, style: .relative).font(.caption2).foregroundStyle(.secondary)
             } else {
-                Text(verbatim: "ESP32 Agent").font(.headline)
+                Text(verbatim: AppName.current).font(.headline)
                 statusText.font(.caption)
             }
         }
@@ -134,6 +134,7 @@ struct AgentWidgetView: View {
 }
 
 /// Control Center: run the last intent; stop the agent.
+@available(iOS 18.0, *)  // Control Center controls: iOS 18
 struct RunLastIntentControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: "RunLastIntent") {
@@ -142,34 +143,52 @@ struct RunLastIntentControl: ControlWidget {
             }
         }
         .displayName("Run Last Intent")
-        .description("Runs the saved intent you ran last on ESP32 Agent.")
+        .description("Runs the saved intent you ran last.")
     }
 }
 
+/// Control Center (or the Action button): the quick task sheet, to type a task or pick an intent.
+@available(iOS 18.0, *)  // Control Center controls: iOS 18
+struct QuickTaskControl: ControlWidget {
+    var body: some ControlWidgetConfiguration {
+        StaticControlConfiguration(kind: "QuickTask") {
+            ControlWidgetButton(action: OpenQuickTaskIntent()) {
+                Label("New Task", systemImage: "text.bubble")
+            }
+        }
+        .displayName("New Task")
+        .description("Opens the app ready to type a task or pick an intent.")
+    }
+}
+
+@available(iOS 18.0, *)  // Control Center controls: iOS 18
 struct StopAgentControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: "StopAgent") {
             ControlWidgetButton(action: StopAgentIntent()) {
-                Label("Stop ESP32 Agent", systemImage: "stop.fill")
+                Label("Stop \(AppName.current)", systemImage: "stop.fill")
             }
         }
-        .displayName("Stop ESP32 Agent")
+        .displayName("Stop \(AppName.current)")
         .description("Stops the running task and lets go of the screen.")
     }
 }
 
+@available(iOS 17.0, *)
 #Preview("Small", as: .systemSmall) {
     AgentStatusWidget()
 } timeline: {
     AgentEntry(date: .now, snapshot: .preview)
 }
 
+@available(iOS 17.0, *)
 #Preview("Medium", as: .systemMedium) {
     AgentStatusWidget()
 } timeline: {
     AgentEntry(date: .now, snapshot: .preview)
 }
 
+@available(iOS 17.0, *)
 #Preview("Lock Screen", as: .accessoryRectangular) {
     AgentStatusWidget()
 } timeline: {

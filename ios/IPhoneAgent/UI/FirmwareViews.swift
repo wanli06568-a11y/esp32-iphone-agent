@@ -12,9 +12,9 @@ struct FirmwareGate: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .task(id: board.connected) { if board.connected { await updater.boardConnected() } }
-            .onChange(of: scene) { _, phase in if phase == .active { updater.ask() } }
-            .onChange(of: agent.running || app.startingAgent || recorder.busy) { _, busy in if !busy { updater.ask() } }
+            .task(id: updater.updatable) { if updater.updatable { await updater.boardConnected() } }
+            .onValueChange(of: scene) { _, phase in if phase == .active { updater.ask() } }
+            .onValueChange(of: agent.running || app.startingAgent || recorder.busy) { _, busy in if !busy { updater.ask() } }
             .sheet(isPresented: $updater.presented) { FirmwareSheet(app: app, updater: updater, board: board) }
     }
 }
@@ -56,15 +56,19 @@ struct FirmwareSection: View {
                 Button { showing = true } label: { Label("Update to \(release.ver.description)", systemImage: "arrow.down.circle") }
             } else if updater.checking {
                 HStack { Text("Checking for Updates…").foregroundStyle(.secondary); Spacer(); ProgressView() }
-            } else {
-                Button("Check for Updates") { Task { await updater.check() } }.disabled(!board.connected)
+            } else if board.status?.isWirelessHID != true || updater.updatable {
+                Button("Check for Updates") { Task { await updater.check() } }.disabled(!updater.updatable)
             }
         } header: {
             Text("Firmware")
         } footer: {
-            if let error = updater.checkError {
+            if board.status?.board == "note4" {
+                Text("Use firmware made for Note 4. Back up the board and follow its USB installation guide.")
+            } else if !updater.updatable && (board.status?.isWirelessHID == true || board.status?.board != nil) {
+                Text("Use firmware for your board model. Back up the board and follow its installation guide.")
+            } else if let error = updater.checkError {
                 Text(verbatim: error)
-            } else if updater.release != nil && !updater.available && board.connected {
+            } else if updater.release != nil && !updater.available && updater.updatable {
                 Text("The board is up to date.")
             }
         }
@@ -119,7 +123,7 @@ struct FirmwareSheet: View {
             Text(updater.required ? "Board Update Required" : "Update the Board").font(.title2.bold())
             Group {
                 if updater.belowMinimum {
-                    Text("This version of ESP32 Agent needs board firmware \(Firmware.required.description) or later.")
+                    Text("This version of \(AppName.current) needs board firmware \(Firmware.required.description) or later.")
                 } else if updater.outdated {
                     Text("Update the board to the latest firmware to keep taps accurate and the connection stable.")
                 } else {
@@ -152,11 +156,13 @@ struct FirmwareSheet: View {
                 Text(verbatim: blocker).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
             } else if !onBoardWiFi {
                 Text(joinText).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                Button { app.startJoin() } label: {
-                    HStack { Text("Join the Board's Wi-Fi"); if app.join.busy { ProgressView().tint(Color(.systemBackground)) } }
+                if !app.lanMode {  // LAN: the phone joins the router itself; there is no board hotspot to join
+                    Button { app.startJoin() } label: {
+                        HStack { Text("Join the Board's Wi-Fi"); if app.join.busy { ProgressView().tint(Color(.systemBackground)) } }
+                    }
+                    .buttonStyle(BigButton(tint: .primary, ink: Color(.systemBackground)))
+                    .disabled(app.join.busy)
                 }
-                .buttonStyle(BigButton(tint: .primary, ink: Color(.systemBackground)))
-                .disabled(app.join.busy)
             } else {
                 Label("On the board's Wi-Fi", systemImage: "checkmark.circle").font(.footnote).foregroundStyle(.secondary)
                 Button("Update Now") { updater.install() }
@@ -172,6 +178,9 @@ struct FirmwareSheet: View {
     }
 
     private var joinText: String {
+        if app.lanMode {
+            return String(localized: "The update goes over Wi-Fi. Join the network the board is on (Settings › Board), then try again.")
+        }
         if case .failed(let reason) = app.join { return reason }
         return String(localized: "The update goes over the board's Wi-Fi. Join it first; the internet keeps working over cellular.")
     }

@@ -35,11 +35,14 @@ struct Deciders: Equatable, Codable {
     mutating func move(from: IndexSet, to: Int) { order.move(fromOffsets: from, toOffset: to) }
 
     /// The free line's X-Handsy-Jev header for the actor: Jev first ("race": Jev and the model at once).
-    func freeLineHeader(race: Bool) -> [String: String] {
-        mode == .jevFirst && !JevGate.hold ? ["X-Handsy-Jev": race ? "race" : "1"] : [:]
+    func freeLineHeader(race: Bool, threshold: Double = JevConfig.threshold) -> [String: String] {
+        guard mode == .jevFirst, !JevGate.hold else { return [:] }
+        return ["X-Handsy-Jev": race ? "race" : "1", "X-Handsy-Jev-Threshold": String(format: "%.2f", threshold)]
     }
 
     static let raceKey = "jevRace"
+    /// Ask both at once unless the user turned it off: a step Jev leaves then costs no time.
+    static func race(_ defaults: UserDefaults = .standard) -> Bool { defaults.object(forKey: raceKey) as? Bool ?? true }
     static func key(freeLine: Bool) -> String { freeLine ? "deciders.free" : "deciders.own" }
     static func standard(freeLine: Bool) -> Deciders { Deciders(order: [.jev, .model], off: freeLine ? [] : [.jev]) }
 
@@ -57,8 +60,8 @@ struct Deciders: Equatable, Codable {
     }
 }
 
-/// Steps go to Jev only after this separate yes, per target: Handsy (Holomix, Inc. and its provider TypeSafe),
-/// or TypeSafe on the user's own key. Handsy Free's own agreement already covers Jev on Handsy.
+/// Steps go to Jev only after this separate yes, per target: Manina AI (Holomix, Inc. and its provider TypeSafe),
+/// or TypeSafe on the user's own key. Manina AI Free's own agreement already covers Jev on Manina AI.
 enum JevConsent {
     static let key = "jevConsentVersion"
     static let version = "2026-11-06"
@@ -81,4 +84,16 @@ enum JevConsent {
 /// the answer). The next step then goes to the model, which brings its plan up to date. Set by AgentLoop.
 enum JevGate {
     nonisolated(unsafe) static var hold = false
+}
+
+extension AgentLoop {
+    /// The next look goes to the model, not Jev: after several gestures in one round (the plan is behind), or after a
+    /// round that wrote something down and then moved the screen. 2026-11-18: the model noted an order, then tapped
+    /// to unfold its details; Jev took the next step from the plan ("go back") and left without reading what the
+    /// tap had revealed, so the model opened the same order again.
+    nonisolated static func modelLooksNext(_ actions: [String]) -> Bool {
+        let gestures = actions.filter { Actions.gestures.contains($0) }.count
+        let recorded = actions.contains { ["note", "read", "progress", "snap"].contains($0) }
+        return gestures > 1 || gestures == 1 && recorded
+    }
 }

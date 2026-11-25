@@ -24,6 +24,8 @@ struct ReviewView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var index = 0
     @State private var playing = false
+    @AppStorage("blurScreens") private var blurScreens = true
+    @State private var revealed = false  // tapped once: this review shows its screens
     @State private var speed = 1.0
     @State private var showVideo = false
     @State private var videoTime = 0.0
@@ -33,6 +35,8 @@ struct ReviewView: View {
     @State private var insertText = ""
     @State private var saving = false
     @State private var optimizing = false
+    @State private var canOptimize = false  // one's own model, or the server's optimize turned on (Trial)
+    @State private var editingPlan = false
     @State private var shareURL: URL?
     @State private var retrying = false
     @State private var retryError: String?
@@ -51,8 +55,11 @@ struct ReviewView: View {
                          ?? String(localized: "The run is still active. Return to the Home Screen to continue."))
                         .font(.subheadline).multilineTextAlignment(.center)
                     if !app.startingAgent {
-                        Button("Stop", systemImage: "stop.fill") { Task { await app.stopAgent() } }
+                        Button(app.stopping ? LocalizedStringKey("Stopping…") : "Stop", systemImage: "stop.fill") {
+                            Task { await app.stopAgent() }
+                        }
                             .buttonStyle(.bordered)
+                            .disabled(app.stopping)
                     }
                 }
                 .padding(Space.l)
@@ -77,6 +84,9 @@ struct ReviewView: View {
             if outcome == .done, let result = draft.runID.flatMap({ runs.run($0) })?.result {
                 ResultCard(text: result)
             }
+            if outcome != .running, let run = draft.runID.flatMap({ runs.run($0) }) {
+                RunOutputsCard(app: app, run: run)
+            }
             if steps.isEmpty {
                 if outcome == .running { Spacer() }
                 else { IntentWordsView(draft: draft) }
@@ -90,7 +100,9 @@ struct ReviewView: View {
                     .padding(.horizontal, Space.xl)
                     .padding(.bottom, Space.xs)
                 }
-                if showVideo && !video.isEmpty {  // continuous video, scrubbed in seconds
+                if DeviceKind.isPad {  // iPad: side by side in landscape (an iPhone is always portrait)
+                    GeometryReader { g in padContent(columns: g.size.width > g.size.height) }
+                } else if showVideo && !video.isEmpty {  // continuous video, scrubbed in seconds
                     RunVideoView(frames: video, time: videoTime, caption: step.map { StepText.title($0.action) })
                     VideoScrubber(start: video[0].t, end: video[video.count - 1].t, time: $videoTime, playing: $playing)
                         .padding(.horizontal, Space.xl)
@@ -106,19 +118,19 @@ struct ReviewView: View {
         .background(Color(uiColor: .systemBackground).ignoresSafeArea())
         .safeAreaInset(edge: .bottom) { if !draft.readOnly && outcome != .running { bottomBar } }
         .task(id: [playing, showVideo]) { await autoplay() }
-        .onChange(of: showVideo) { playing = false }
-        .onChange(of: videoTime) { _, t in  // the step follows the video
+        .onValueChange(of: showVideo) { playing = false }
+        .onValueChange(of: videoTime) { _, t in  // the step follows the video
             guard showVideo, let i = steps.lastIndex(where: { ($0.t ?? 0) <= t }), i != index else { return }
             index = i
         }
-        .onChange(of: index) { _, i in
+        .onValueChange(of: index) { _, i in
             Haptics.tick()
             if !playing, let t = steps[safe: i]?.t { videoTime = t }
         }
         .onAppear {
             video = draft.runID.flatMap { app.runs.run($0) }?.video ?? []
             videoTime = steps.first?.t ?? 0
-            if let firstUnsure = steps.firstIndex(where: \.uncertain) { index = firstUnsure }
+            index = 0  // Henry 2026-11-13: from the first step; "Next unsure" jumps to the yellow ones
         }
         .alert("Could not save changes", isPresented: Binding(get: { draft.persistenceError != nil }, set: { if !$0 { draft.persistenceError = nil } })) {
             Button("Try Again") { draft.saveEdits() }
@@ -127,6 +139,12 @@ struct ReviewView: View {
         .sheet(item: $fixing) { s in FixSheet(draft: draft, step: s) }
         .sheet(isPresented: $saving) { SaveIntentSheet(draft: draft, intents: app.intents) { app.recorder.markSaved(draft); dismiss() } }
         .sheet(isPresented: $optimizing) { OptimizeSheet(draft: draft, app: app) }
+        .task { canOptimize = app.settings.provider != .handsyTrial ? true : await Trial.shared.optimizeOn() }
+        .sheet(isPresented: $editingPlan) {
+            if let folder = draft.folder {
+                NavigationStack { PlanEditView(app: app, folder: folder, draft: draft) }
+            }
+        }
         .sheet(item: $shareURL) { ShareSheet(items: [$0]) }
         .alert("Insert a step", isPresented: $inserting) {
             TextField("e.g. Tap Save at the top right", text: $insertText)
@@ -153,11 +171,18 @@ struct ReviewView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(verbatim: draft.title).font(.headline).lineLimit(1)
                 subtitle.font(.caption)
+                if let (median, parts) = timingSummary {  // two whole lines: never broken mid-phrase
+                    Group {
+                        Text(verbatim: median)
+                        Text(verbatim: parts)
+                    }
+                    .font(.caption2).foregroundStyle(.secondary).monospacedDigit().lineLimit(1).minimumScaleFactor(0.75)
+                }
             }
             Spacer()
             Menu {
                 if let folder = draft.folder {
-                    Button { shareURL = try? TraceStore.zip(folder) } label: {
+                    Button { shareURL = try? TraceStore.zipForSharing(folder, name: "trace.zip") } label: {
                         Label("Export trace", systemImage: "square.and.arrow.up")
                     }
                 }
@@ -171,6 +196,16 @@ struct ReviewView: View {
         }
         .padding(.horizontal, Space.l)
         .padding(.vertical, Space.s)
+    }
+
+    private var timingSummary: (String, String)? {
+        let rows = steps.compactMap { StepTiming.read($0.action) }
+        guard !rows.isEmpty, let median = Metrics.median(rows.map(\.total)) else { return nil }
+        let sum = rows.reduce(StepTiming.zero) { $0.adding($1) }
+        func share(_ part: Double) -> Int { Int((part / max(sum.total, 1) * 100).rounded()) }
+        return (String(format: "Median step %.1f s", median / 1000),
+                String(format: "model %d%% · screen %d%% · check %d%% · actions %d%% · other %d%%",
+                       share(sum.modelBefore + sum.modelAfter), share(sum.frame), share(sum.verdict), share(sum.hid), share(sum.other)))
     }
 
     @ViewBuilder private var subtitle: some View {
@@ -190,10 +225,59 @@ struct ReviewView: View {
     private var media: some View {
         TabView(selection: $index) {
             ForEach(Array(steps.enumerated()), id: \.element.id) { i, s in
-                StepFrame(step: s, active: i == index).tag(i).padding(.horizontal, Space.l)
+                StepFrame(step: s, active: i == index, hidden: blurScreens && !revealed).tag(i).padding(.horizontal, Space.l)
+                    .onTapGesture { revealed = true }
             }
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
+    }
+
+    /// The next yellow step after this one (or the first, from the last).
+    private var nextUnsure: Int? {
+        steps.indices.first { $0 > index && steps[$0].uncertain } ?? steps.indices.first { $0 < index && steps[$0].uncertain }
+    }
+
+    /// iPad: the iPhone's column, or in landscape the screenshot (or video) on the left and the step, timeline and
+    /// controls on the right, so the wide screenshot isn't squeezed into a strip above them.
+    @ViewBuilder private func padContent(columns: Bool) -> some View {
+        let videoView = showVideo && !video.isEmpty
+        if columns {
+            HStack(spacing: 0) {
+                if videoView {
+                    VStack(spacing: 0) {
+                        RunVideoView(frames: video, time: videoTime, caption: step.map { StepText.title($0.action) })
+                        VideoScrubber(start: video[0].t, end: video[video.count - 1].t, time: $videoTime, playing: $playing)
+                            .padding(.horizontal, Space.xl)
+                            .padding(.bottom, Space.xs)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    controls.frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    media.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    ScrollView(.vertical) {
+                        VStack(spacing: 0) {
+                            stepCard
+                            ReviewTimeline(steps: steps, index: $index, playing: $playing).padding(.horizontal, Space.xl)
+                            controls
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+        } else {
+            VStack(spacing: 0) {
+                if videoView {
+                    RunVideoView(frames: video, time: videoTime, caption: step.map { StepText.title($0.action) })
+                    VideoScrubber(start: video[0].t, end: video[video.count - 1].t, time: $videoTime, playing: $playing)
+                        .padding(.horizontal, Space.xl)
+                } else {
+                    media
+                    stepCard
+                    ReviewTimeline(steps: steps, index: $index, playing: $playing).padding(.horizontal, Space.xl)
+                }
+                controls
+            }
+        }
     }
 
     @ViewBuilder private var stepCard: some View {
@@ -206,8 +290,16 @@ struct ReviewView: View {
                         Label("Unsure", systemImage: "questionmark.circle").font(.caption2.weight(.bold)).padding(.horizontal, 6).padding(.vertical, 2)
                             .background(Capsule().fill(Color.yellow.opacity(0.35)))
                     }
+                    if step.action["detour"] == .bool(true) {
+                        Text("Detour · left out").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                    }
                     Spacer()
+                    if let next = nextUnsure {
+                        Button { index = next } label: { Label("Next Unsure", systemImage: "arrow.forward.circle") }
+                            .font(.caption.weight(.semibold)).tint(.orange)
+                    }
                 }
+                if let timing = StepTiming.read(step.action) { StepTimingBar(timing: timing) }
                 if let thought = step.action["thought"]?.str ?? step.action["plan"]?.str ?? step.action["reason"]?.str {
                     Text(verbatim: thought).font(.subheadline).foregroundStyle(.secondary).lineLimit(expanded ? nil : 2)
                         .onTapGesture { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { expanded.toggle() } }
@@ -358,8 +450,14 @@ struct ReviewView: View {
                         .disabled(retrying || app.startingAgent || app.agent.running || app.recorder.busy)
                     if retrying { ProgressView("Reconnecting…") }
                 }
+                if draft.isDemo, draft.folder != nil {
+                    Button("Edit plan", systemImage: "text.bubble", action: editPlan)
+                        .buttonStyle(BigButton.tinted)
+                }
                 HStack(spacing: Space.m) {
-                    Button { optimizing = true } label: { Label("Optimize with AI", systemImage: "sparkles") }
+                    if canOptimize {
+                        Button { optimizing = true } label: { Label("Optimize with AI", systemImage: "sparkles") }
+                    }
                     Button { saving = true } label: {
                         Label(draft.intentID == nil ? "Save as Intent" : "Save Intent", systemImage: "bookmark")
                     }
@@ -373,6 +471,8 @@ struct ReviewView: View {
     private var resumable: Bool { !draft.readOnly && currentRun.map(app.canResume) == true }
     private var currentRun: Run? { draft.runID.flatMap { runs.run($0) } }
     private var retryable: Bool { draft.runID != nil && (outcome == .failed || outcome == .stopped) }
+
+    private func editPlan() { editingPlan = true }
 
     private func retryRun() {
         guard !retrying, !app.startingAgent, !app.agent.running, !app.recorder.busy,
@@ -436,6 +536,66 @@ struct StepDetails: View {
             Text(verbatim: key).font(.caption2.weight(.bold).monospaced()).foregroundStyle(.secondary)
                 .frame(width: 58, alignment: .leading)
             Text(verbatim: value).font(.caption.monospaced()).textSelection(.enabled)
+        }
+    }
+}
+
+/// Where one step's time went, from the trace's timing row. Milliseconds.
+struct StepTiming: Equatable {
+    var frame = 0.0, verdict = 0.0, modelBefore = 0.0, modelAfter = 0.0, hid = 0.0, other = 0.0
+    var total: Double { frame + verdict + modelBefore + modelAfter + hid + other }
+    static let zero = StepTiming()
+
+    func adding(_ other: StepTiming) -> StepTiming {
+        StepTiming(frame: frame + other.frame, verdict: verdict + other.verdict,
+                   modelBefore: modelBefore + other.modelBefore, modelAfter: modelAfter + other.modelAfter,
+                   hid: hid + other.hid, other: self.other + other.other)
+    }
+
+    static func read(_ action: JObject) -> StepTiming? {
+        guard case .obj(let t)? = action["timing"] else { return nil }
+        func n(_ key: String) -> Double { t[key]?.double ?? 0 }
+        let llm = n("llm_ms"), first = n("first_token_ms")
+        let before = first > 0 ? min(first, llm) : llm
+        return StepTiming(frame: n("frame_ms"), verdict: n("verdict_ms") + n("landing_ms"),
+                          modelBefore: before, modelAfter: max(0, llm - before), hid: n("hid_ms"),
+                          other: n("other_ms") + n("lead_ms") + n("housekeeping_ms"))
+    }
+}
+
+struct StepTimingBar: View {
+    var timing: StepTiming
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            GeometryReader { geo in
+                let width = geo.size.width
+                let total = max(timing.total, 1)
+                HStack(spacing: 1) {
+                    piece(timing.frame, total, width, .blue)
+                    piece(timing.verdict, total, width, .orange)
+                    piece(timing.modelBefore, total, width, .purple)
+                    piece(timing.modelAfter, total, width, .indigo)
+                    piece(timing.hid, total, width, .green)
+                    piece(timing.other, total, width, .gray)
+                }
+            }
+            .frame(height: 8)
+            .clipShape(Capsule())
+            Text(caption).font(.caption2).foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: caption))
+    }
+
+    private var caption: String {
+        String(format: "Screen %.0f · check %.0f · model %.0f+%.0f · actions %.0f · other %.0f ms",
+               timing.frame, timing.verdict, timing.modelBefore, timing.modelAfter, timing.hid, timing.other)
+    }
+
+    @ViewBuilder private func piece(_ value: Double, _ total: Double, _ width: CGFloat, _ color: Color) -> some View {
+        if value > 0 {
+            color.frame(width: max(2, width * value / total))
         }
     }
 }

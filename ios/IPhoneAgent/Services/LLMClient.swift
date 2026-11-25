@@ -7,21 +7,33 @@ import UniformTypeIdentifiers
 /// model answers in 0-1000 coordinates, so a smaller image keeps taps where they were.
 enum ModelImage {
     static let maxWidth = 540, quality = 0.6
+    /// iPad: a pixel budget instead of a width, about an iPhone's: 540 px wide left a landscape iPad at 540x375, too
+    /// coarse to read its tab bar (2026-10-26), while its whole 834x1200 frame cost ~1.6x an iPhone's tokens and upload
+    /// (2026-11-17: 3,700 prompt tokens a step on Qwen, 112-131 KB). 720k pixels is ~1.15x an iPhone's 540x1170:
+    /// 1017x707 in landscape, 707x1017 in portrait. A frame within it goes as decoded.
+    static let padPixels = 720_000
     /// Settings › Model › Advanced; on unless turned off.
     static let key = "shrinkModelImage"
     static var on: Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
 
     /// The copy for the model: shrunk, or the full frame with the setting off.
-    static func forModel(_ jpeg: Data) -> Data { on ? shrink(jpeg) : jpeg }
+    static func forModel(_ jpeg: Data) -> Data { on ? shrink(jpeg, maxPixels: DeviceKind.isPad ? padPixels : nil) : jpeg }
 
-    static func shrink(_ jpeg: Data) -> Data {
+    /// maxPixels nil (iPhone): at most `maxWidth` wide.
+    static func shrink(_ jpeg: Data, maxPixels: Int? = nil) -> Data {
         guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = props[kCGImagePropertyPixelWidth] as? Int, let height = props[kCGImagePropertyPixelHeight] as? Int
         else { return jpeg }
+        var longSide = max(width, height) * min(maxWidth, width) / width
+        if let maxPixels {
+            let scale = (Double(maxPixels) / Double(max(width * height, 1))).squareRoot()
+            guard scale < 1 else { return jpeg }
+            longSide = Int(Double(max(width, height)) * scale)
+        }
         let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
                                         kCGImageSourceCreateThumbnailWithTransform: true,
-                                        kCGImageSourceThumbnailMaxPixelSize: max(width, height) * min(maxWidth, width) / width]
+                                        kCGImageSourceThumbnailMaxPixelSize: longSide]
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return jpeg }
         let out = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(out, UTType.jpeg.identifier as CFString, 1, nil) else { return jpeg }
@@ -31,9 +43,10 @@ enum ModelImage {
     }
 }
 
-struct ChatResult {
+struct ChatResult: Sendable {
     var text: String
     var firstToken: Double?  // seconds until the first streamed token
+    var firstDo: Double? = nil  // seconds until the first complete DO line; measurement only
     var total: Double
     var finishReason: String?       // "stop", "length" (max tokens hit), …
     var usage: [String: Int] = [:]  // prompt_tokens, completion_tokens, … when the server sends them
@@ -67,7 +80,41 @@ struct LLMError: LocalizedError {
     let message: String
     var status = 0  // the HTTP status, when the server answered with an error
     var kind: String?  // for usage stats, e.g. "rate_limit_day"
+    var reason: String?  // free line: the server's exact reason (or the transport failure), for logs and usage stats
     var errorDescription: String? { message }
+
+    /// Manina AI's line (free or a Manina AI key), mid-run: anything on the server's side reads as busy, never as the app
+    /// failing. Not "Manina AI Free": a key run got that text for one Cloudflare 520 (2026-11-17).
+    static var lineBusy: String {
+        String(localized: "Manina AI's AI service is busy or didn't answer, so this run was paused. Tap Continue in a moment to pick up where it left off.")
+    }
+
+    /// The AI service's content filter refused the request (2026-11-17: HTTP 500 sensitive_words_detected on a page
+    /// of trending headlines). The same screen would be refused again, so the run stops and says why.
+    static var contentRefused: String {
+        String(localized: "The AI service refused this screen, most likely because its content filter blocks words on it (news headlines and trending lists often trigger it). The run was paused. Leave this page, then tap Continue, or use another AI service.")
+    }
+
+    /// Any other server error from the user's own AI service: shown as it is, with what it usually means.
+    static func serverFailed(_ host: String, _ status: Int, _ text: String) -> String {
+        String(localized: "The AI service \(host) failed (HTTP \(status)), usually a passing problem on its side. Tap Continue in a moment. If it fails again on the same screen, the service may be refusing what is on it. Its reply: \(text)")
+    }
+
+    /// The error text of a request the provider's content filter refused (any provider's wording, any status).
+    nonisolated static func contentFiltered(_ errorText: String) -> Bool {
+        let text = errorText.lowercased()
+        return ["sensitive_words", "content_filter", "data_inspection_failed", "content_policy", "moderation"].contains { text.contains($0) }
+    }
+
+    /// The free line ended this run (its lease): the run stops instead of retrying.
+    static let trialRunEnded = LLMError(message: lineBusy, status: 503, kind: "trial_run_ended")
+    /// The same when the run's time ran out: said as it is, not as a busy service (a run at 30 min, 2026-11-18).
+    /// Continue claims a new lease and goes on.
+    static var trialTimeUp: LLMError {
+        LLMError(message: String(localized: "This free run reached its time limit, so it was paused. Tap Continue to pick up where it left off."),
+                 status: 503, kind: trialRunEnded.kind)
+    }
+    static let timeUpReasons: Set<String> = ["lease_ended", "lease_time_exhausted", "lease_expired"]
 }
 
 /// Client for any OpenAI-compatible chat endpoint (vision models). Port of llm.py, with streaming:
@@ -80,8 +127,10 @@ struct LLMError: LocalizedError {
     let model: String
     let baseURL: URL
     private let apiKey: String
-    private let extra: [String: Any]
+    let extra: [String: Any]
     private let headers: (() throws -> [String: String])?  // extra per-request headers (e.g. the free line's lease)
+    /// false for the record reader: a 503 call_in_progress (the actor's call on the same lease) is not waited out.
+    var retriesBusy = true
     private(set) var tokenParam: String
     private var auto: Bool
     // some reasoning models allow only their default temperature; drop it for good once the server says so
@@ -110,13 +159,20 @@ struct LLMError: LocalizedError {
         // "auto": send max_tokens; switch for good if the server asks for max_completion_tokens
         if Self.tokenParams.contains(tokenParam) { (self.tokenParam, auto) = (tokenParam, false) }
         else { (self.tokenParam, auto) = ("max_tokens", true) }
-        let slow = self.baseURL.host?.hasSuffix("openrouter.ai") == true  // free models queue and route
+        let limits = Self.timeouts(baseURL: self.baseURL, freeLine: Trial.isTrial(trimmed))
         self.session = session ?? {
             let config = URLSessionConfiguration.default
-            config.timeoutIntervalForRequest = slow ? 60 : 30  // no byte for this long = hung; the agent retries
-            config.timeoutIntervalForResource = slow ? 180 : 90
+            config.timeoutIntervalForRequest = limits.request  // no byte for this long = hung; the agent retries
+            config.timeoutIntervalForResource = limits.resource
             return URLSession(configuration: config)
         }()
+    }
+
+    /// Free models on OpenRouter queue and route; the free line can take up to about a minute before its first
+    /// byte when its GPU is shared, so it waits longer than that.
+    static func timeouts(baseURL: URL, freeLine: Bool) -> (request: Double, resource: Double) {
+        if freeLine { return (75, 180) }
+        return baseURL.host?.hasSuffix("openrouter.ai") == true ? (60, 180) : (30, 90)
     }
 
     func chat(system: String, text: String, image: Data? = nil, maxTokens: Int = 600,
@@ -156,8 +212,23 @@ struct LLMError: LocalizedError {
         let kb = images.reduce(0) { $0 + $1.count } / 1024
         DebugLog.write("llm → \(model) @ \(endpointOrigin): \(images.count) image(s) \(kb) KB, \(text.count) chars")
         var status = 0, result: ChatResult?, errorText = ""
+        // free line: one id per model call, kept by its retries below, so the gateway can tell a retry from a new call
+        let requestID = UUID().uuidString.lowercased()
+        // a connection that failed to open (2026-11-19: four "TLS error" in 0.3 s paused one run four times): again
+        // after 1.5 s, twice at most; the same request id lets the gateway tell the retry from a new call
+        func send(_ body: [String: Any]) async throws -> (Int, ChatResult?, String) {
+            var attempt = 0
+            while true {
+                do { return try await post(body, maxTokens: maxTokens, started: started, requestID: requestID) }
+                catch let e as URLError where attempt < 2 && Self.connectionDrop(e) {
+                    attempt += 1
+                    DebugLog.write("llm: connection failed (\(e.code.rawValue)), retrying in 1.5 s")
+                    try await Task.sleep(for: .seconds(1.5))
+                }
+            }
+        }
         do {
-            (status, result, errorText) = try await post(body, maxTokens: maxTokens, started: started)
+            (status, result, errorText) = try await send(body)
             // A 400 names one refused parameter at a time: a model may refuse both, in either order.
             for _ in 0..<2 where status == 400 {
                 if auto && errorText.contains("max_completion_tokens") {
@@ -167,27 +238,43 @@ struct LLMError: LocalizedError {
                     body["temperature"] = nil
                     DebugLog.write("llm: \(model) rejects an explicit temperature; retrying without it")
                 } else { break }
-                (status, result, errorText) = try await post(body, maxTokens: maxTokens, started: started)
+                (status, result, errorText) = try await send(body)
             }
             // A busy upstream: once more. A per-minute rate limit: wait as told (Retry-After, at most 20 s), up
             // to twice. A daily quota (OpenRouter free models): retrying can't help, so say so plainly.
-            for attempt in 0..<2 where [429, 502, 503, 504].contains(status) {
+            // 5xx: Cloudflare's 520-524 too (2026-11-17: one 520 paused a run that a retry 3 s later carried on)
+            for attempt in 0..<2 where status == 429 || (500...599).contains(status) && status != 501 {
                 if status == 429 && Self.dailyLimit(errorText) { break }
+                if LLMError.contentFiltered(errorText) { break }  // the same screen is refused again
+                // the lease's time at its end: the gateway may extend it a moment later (2026-11-18: a run stopped
+                // as "time limit" one second before the gateway gave it 30 more minutes), so once more after 2 s
+                let atLeaseEnd = attempt == 0 && Self.busyReason(errorText) == "lease_time_exhausted"
+                if !atLeaseEnd, Self.trialRunEnded(errorText) || Self.trialUsedUp(errorText) || Self.keyError(errorText) != nil { break }  // final: asking again can't help
+                if !retriesBusy, Self.busyReason(errorText) == "call_in_progress" { break }  // the record reader: skip this screen
                 if status != 429 && attempt > 0 { break }
-                let wait = status == 429 ? min(retryAfter ?? 5, 20) : 3
+                let wait = status == 429 ? min(retryAfter ?? 5, 20) : atLeaseEnd ? 2 : 3
                 DebugLog.write(String(format: "llm: HTTP %d, retrying in %.0f s", status, wait))
                 try await Task.sleep(for: .seconds(wait))
-                (status, result, errorText) = try await post(body, maxTokens: maxTokens, started: started)
+                (status, result, errorText) = try await send(body)
             }
         } catch {
             DebugLog.write(String(format: "llm ✗ %@ after %.1f s: %@", model, now() - started, error.localizedDescription))
-            throw error
+            throw Trial.isTrial(baseURL.absoluteString) ? Self.freeLineError(error) : error
         }
         guard (200..<300).contains(status), var result else {
             DebugLog.write(String(format: "llm ✗ HTTP %d after %.1f s: %@", status, now() - started, String(errorText.prefix(200))))
+            if Trial.isTrial(baseURL.absoluteString), let refused = Self.freeLineError(status: status, errorText: errorText) {
+                // a refused Manina AI key says nothing about the install's own token
+                if status == 401, Self.keyError(errorText) == nil { Trial.shared.tokenRefused() }  // token refused: the next run enrolls again
+                else if refused.kind == LLMError.trialRunEnded.kind { Trial.shared.runEnded() }
+                throw refused
+            }
             if status == 429 { throw Self.rateLimitError(errorText, openRouter: baseURL.host?.hasSuffix("openrouter.ai") == true) }
-            if status == 503 && Trial.isTrial(baseURL.absoluteString) {  // the free line took the run back or is full
-                throw LLMError(message: String(localized: "Handsy Free is busy or ended this run. Tap Retry in a moment."), status: status)
+            if LLMError.contentFiltered(errorText) {
+                throw LLMError(message: LLMError.contentRefused, status: status, kind: "content_filter")
+            }
+            if status >= 500 {
+                throw LLMError(message: LLMError.serverFailed(baseURL.host ?? "", status, String(errorText.prefix(300))), status: status)
             }
             throw LLMError(message: "LLM HTTP \(status): \(errorText.prefix(300))", status: status)
         }
@@ -202,6 +289,84 @@ struct LLMError: LocalizedError {
     static func dailyLimit(_ errorText: String) -> Bool {
         let t = errorText.lowercased()
         return t.contains("per-day") || t.contains("per day") || t.contains("daily")
+    }
+
+    /// The free line refused because this run's lease is over (idle too long, out of time, paused, call limit):
+    /// every further call would be refused too.
+    /// The free line's reason in a 503 `{"status":"busy","reason":…}`, else nil.
+    nonisolated static func busyReason(_ errorText: String) -> String? {
+        guard let body = try? JSONSerialization.jsonObject(with: Data(errorText.utf8)) as? [String: Any],
+              body["status"] as? String == "busy" else { return nil }
+        return body["reason"] as? String
+    }
+
+    nonisolated static func trialRunEnded(_ errorText: String) -> Bool {
+        guard let body = try? JSONSerialization.jsonObject(with: Data(errorText.utf8)) as? [String: Any],
+              body["status"] as? String == "busy", let reason = body["reason"] as? String else { return false }
+        return reason.hasPrefix("lease_") || ["admin_paused", "run_mismatch", "task_call_limit"].contains(reason)
+    }
+
+    /// The free line refused because the free runs (or today's) are used up: final too, never asked again.
+    nonisolated static func trialUsedUp(_ errorText: String) -> Bool {
+        ["quota", "rate_limit_day"].contains(trialReason(errorText))
+    }
+
+    /// A Manina AI key the gateway refuses: unknown, revoked or expired (key_invalid), or nothing left on its plan
+    /// or its own limit (key_balance, key_limit). Final: asking again can't help.
+    nonisolated static func keyError(_ errorText: String) -> TrialError? {
+        switch trialReason(errorText) {
+        case "key_invalid": return .keyRefused
+        case "key_balance", "key_limit": return .keyEmpty
+        default: return nil
+        }
+    }
+
+    nonisolated static func trialReason(_ errorText: String) -> String? {
+        let body = try? JSONSerialization.jsonObject(with: Data(errorText.utf8)) as? [String: Any]
+        return body?["reason"] as? String
+    }
+
+    /// Free line, an HTTP refusal: used up (all or today's) keeps its own text; the run ended by the server, a
+    /// refused token and any 5xx read as busy. Nil: the request's own fault (400) or a per-minute limit (429).
+    nonisolated static func freeLineError(status: Int, errorText: String) -> LLMError? {
+        let reason = trialReason(errorText)
+        if let key = keyError(errorText) {
+            return LLMError(message: key.localizedDescription, status: status, kind: "handsy_key", reason: reason)
+        }
+        switch reason {
+        case "quota": return LLMError(message: TrialError.usedUp.localizedDescription, status: status, kind: "rate_limit_day", reason: reason)
+        case "rate_limit_day":
+            return LLMError(message: TrialError.usedUpToday.localizedDescription, status: status, kind: "rate_limit_day", reason: reason)
+        default: break
+        }
+        if trialRunEnded(errorText) || status == 401 {
+            var ended = LLMError.timeUpReasons.contains(reason ?? "") ? LLMError.trialTimeUp : LLMError.trialRunEnded
+            ended.reason = reason ?? "http_\(status)"
+            return ended
+        }
+        if reason == "content_filtered" || LLMError.contentFiltered(errorText) {
+            return LLMError(message: LLMError.contentRefused, status: status, kind: "content_filter", reason: reason ?? "content_filtered")
+        }
+        guard status >= 500 else { return nil }
+        return LLMError(message: LLMError.lineBusy, status: status, reason: reason ?? "http_\(status)")
+    }
+
+    /// A connection that never opened or broke before an answer, which a moment later usually works.
+    nonisolated static func connectionDrop(_ e: URLError) -> Bool {
+        [.secureConnectionFailed, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+         .notConnectedToInternet].contains(e.code)
+    }
+
+    /// Free line, no answer: a timeout, a dropped connection, a stream cut or its error event read as busy too.
+    nonisolated static func freeLineError(_ error: Error) -> Error {
+        if let e = error as? URLError, e.code != .cancelled {
+            return LLMError(message: LLMError.lineBusy, kind: e.code == .timedOut ? "timeout" : "network",
+                            reason: "url_\(e.code.rawValue)")
+        }
+        if let e = error as? LLMError, e.status == 0, e.reason != nil {  // from the stream (not consent or setup)
+            return LLMError(message: LLMError.lineBusy, kind: e.kind, reason: e.reason)
+        }
+        return error
     }
 
     static func rateLimitError(_ errorText: String, openRouter: Bool) -> LLMError {
@@ -228,7 +393,7 @@ struct LLMError: LocalizedError {
     /// The model ids from GET {base}/models (OpenAI list format: {"data": [{"id": ...}]}), in the endpoint's order.
     static func models(baseURL: String, apiKey: String) async throws -> [String] {
         var seen = Set<String>()
-        return try await listing(baseURL: baseURL, apiKey: apiKey).compactMap { ($0["id"] ?? $0["name"]) as? String }
+        return try await listing(baseURL: baseURL, apiKey: apiKey).compactMap { ($0["id"] ?? $0["name"] ?? $0["model"]) as? String }
             .filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
@@ -262,11 +427,14 @@ struct LLMError: LocalizedError {
         guard (200..<300).contains(status) else {
             throw LLMError(message: "GET /models: HTTP \(status) \(String(decoding: data.prefix(200), as: UTF8.self))")
         }
-        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        return (json?["data"] as? [[String: Any]]) ?? (json?["models"] as? [[String: Any]]) ?? []
+        // {"data": [{"id"}]} (OpenAI), {"models": [...]}, a bare array, or lists of plain ids
+        let json = try? JSONSerialization.jsonObject(with: data)
+        let dict = json as? [String: Any]
+        let items = (dict?["data"] ?? dict?["models"] ?? json) as? [Any] ?? []
+        return items.compactMap { $0 as? [String: Any] ?? ($0 as? String).map { ["id": $0] } }
     }
 
-    private func post(_ body: [String: Any], maxTokens: Int, started: Double) async throws
+    private func post(_ body: [String: Any], maxTokens: Int, started: Double, requestID: String) async throws
         -> (Int, ChatResult?, String) {
         try AIConsent.check(baseURL.absoluteString)
         var body = body
@@ -285,11 +453,28 @@ struct LLMError: LocalizedError {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if !apiKey.isEmpty { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
-        for (name, value) in try headers?() ?? [:] { request.setValue(value, forHTTPHeaderField: name) }
+        if let headers {  // free line: its lease, and this call's id
+            for (name, value) in try headers() { request.setValue(value, forHTTPHeaderField: name) }
+            request.setValue(requestID, forHTTPHeaderField: "X-Request-ID")
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
+        // Read and parse off the main thread (2026-11-19, Gaode: the gateway answered in 3.0 s, the app finished
+        // reading 47 s later; the stream, with the free line's tree, was read byte by byte on a busy main thread).
+        let session = session
+        let report: @Sendable () -> Void = { [weak self] in Task { @MainActor in self?.onProgress?(.receiving) } }
+        let (status, result, errorText, retry) = try await Task.detached(priority: .userInitiated) {
+            try await Self.read(session: session, request: request, started: started, receiving: report)
+        }.value
+        retryAfter = retry
+        return (status, result, errorText)
+    }
+
+    /// One request's answer: HTTP status, the parsed result (2xx), the error body otherwise, and Retry-After.
+    nonisolated static func read(session: URLSession, request: URLRequest, started: Double,
+                                 receiving: @Sendable () -> Void) async throws -> (Int, ChatResult?, String, Double?) {
         let (bytes, response) = try await session.bytes(for: request)
-        retryAfter = ((response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")).flatMap(Double.init)
+        let retry = ((response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")).flatMap(Double.init)
         let responseSeconds = now() - started
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         let type = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type") ?? ""
@@ -297,23 +482,23 @@ struct LLMError: LocalizedError {
         guard (200..<300).contains(status) else {
             var raw = Data()
             for try await b in bytes { raw.append(b) }
-            return (status, nil, String(decoding: raw, as: UTF8.self))
+            return (status, nil, String(decoding: raw, as: UTF8.self), retry)
         }
         if !type.contains("text/event-stream") {  // a plain JSON answer
             var raw = Data()
             for try await b in bytes { raw.append(b) }
             var result = try Self.message(raw)
             result.responseSeconds = responseSeconds
-            if !result.text.isEmpty || result.reasoningChars > 0 { onProgress?(.receiving) }
-            return (status, result, "")
+            if !result.text.isEmpty || result.reasoningChars > 0 { receiving() }
+            return (status, result, "", retry)
         }
         var result = ChatResult(text: "", firstToken: nil, total: 0)
         result.responseSeconds = responseSeconds
-        var reportedReceiving = false
+        var reportedReceiving = false, done = false
         for try await line in bytes.lines {
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            if payload == "[DONE]" { break }
+            if payload == "[DONE]" { done = true; break }
             guard let json = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any] else { continue }
             try Self.checkError(json)
             if let tree = Self.tree(json) { result.tree = tree; continue }
@@ -323,19 +508,25 @@ struct LLMError: LocalizedError {
             let reasoning = Self.reasoning(delta)
             if !reportedReceiving, !reasoning.isEmpty || !(delta?["content"] as? String ?? "").isEmpty {
                 reportedReceiving = true
-                onProgress?(.receiving)
+                receiving()
             }
             result.reasoningChars += reasoning.count
             guard let piece = delta?["content"] as? String, !piece.isEmpty else { continue }
             if result.firstToken == nil { result.firstToken = now() - started }
             result.text += piece
+            if result.firstDo == nil, StreamMarks.completeDoLine(result.text) { result.firstDo = now() - started }
+        }
+        // A stream cut before its end (no [DONE], no finish_reason) is a lost reply, not a short one.
+        guard done || result.finishReason != nil else {
+            DebugLog.write("llm: stream ended early after \(result.text.count) chars")
+            throw LLMError(message: "the model's reply stream ended before it finished", reason: "stream_cut")
         }
         result.rawChars = result.text.count
-        return (status, result, "")
+        return (status, result, "", retry)
     }
 
     /// choices[0].message of a non-streamed reply.
-    static func message(_ raw: Data) throws -> ChatResult {
+    nonisolated static func message(_ raw: Data) throws -> ChatResult {
         let json = try JSONSerialization.jsonObject(with: raw) as? [String: Any]
         if let json { try Self.checkError(json) }
         let choice = (json?["choices"] as? [[String: Any]])?.first
@@ -351,27 +542,35 @@ struct LLMError: LocalizedError {
     }
 
     /// The free line's `{"handsy": {"tree": …}}` (sent before [DONE], or inside a non-streamed result).
-    static func tree(_ json: [String: Any]) -> Data? {
+    nonisolated static func tree(_ json: [String: Any]) -> Data? {
         guard let tree = (json["handsy"] as? [String: Any])?["tree"] as? [String: Any] else { return nil }
         return try? JSONSerialization.data(withJSONObject: tree)
     }
 
     /// Providers can report errors inside an HTTP 200 stream or JSON response.
-    private static func checkError(_ json: [String: Any]) throws {
+    private nonisolated static func checkError(_ json: [String: Any]) throws {
         guard let error = json["error"] else { return }
         let message = (error as? [String: Any])?["message"] as? String ?? (error as? String) ?? "Provider error"
-        throw LLMError(message: String(message.prefix(300)))
+        let code = (error as? [String: Any])?["code"].map { "\($0)" }  // e.g. the free line's "busy"
+        throw LLMError(message: String(message.prefix(300)), reason: code ?? "stream_error")
     }
 
     /// finish_reason and usage, from whichever event carries them.
-    private static func note(_ json: [String: Any], _ choice: [String: Any]?, into result: inout ChatResult) {
+    private nonisolated static func note(_ json: [String: Any], _ choice: [String: Any]?, into result: inout ChatResult) {
         if let reason = choice?["finish_reason"] as? String { result.finishReason = reason }
         if let usage = json["usage"] as? [String: Any] { result.usage = usage.compactMapValues { $0 as? Int } }
         if let model = json["model"] as? String, !model.isEmpty { result.servedModel = model }
     }
 
     /// Reasoning text (vLLM/DeepSeek `reasoning_content`, others `reasoning`).
-    private static func reasoning(_ part: [String: Any]?) -> String {
+    private nonisolated static func reasoning(_ part: [String: Any]?) -> String {
         part?["reasoning_content"] as? String ?? part?["reasoning"] as? String ?? ""
+    }
+}
+
+/// When the first complete `DO:` line has arrived in a streamed reply. Measurement only.
+enum StreamMarks {
+    static func completeDoLine(_ text: String) -> Bool {
+        text.range(of: #"(?m)^\s*DO\s*[:：].+\n"#, options: .regularExpression) != nil
     }
 }

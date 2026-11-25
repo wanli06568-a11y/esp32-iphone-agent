@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 #if DEBUG
 /// Explicit developer input, separate from UserDefaults' temporary argument overrides.
@@ -58,7 +59,10 @@ struct ModelLaunchConfiguration {
 /// Drive the app without touching the phone, for development:
 ///   iphoneagent://run?task=<urlencoded>   iphoneagent://calibrate   iphoneagent://stop
 ///   iphoneagent://bench?kb=256             iphoneagent://snap
-/// or launch arguments: -run "<task>", -calibrate, -bench 256, -snap (Debug also -harness-ota <dir>, HarnessOTA.swift; -hid "<cmd>; …")
+///   iphoneagent://intent?name=<n>&prompt=<p>  (adds a saved intent at the top)
+///   iphoneagent://display?try=1040x720,1440x1000   (Debug: advertise each size for one mirroring session, log what
+///                                                  iOS streams, then go back to the default; ?reset=1 stops)
+/// or launch arguments: -run "<task>", -calibrate, -manualcal, -bench 256, -snap (Debug also -harness-ota <dir>, HarnessOTA.swift; -hid "<cmd>; …")
 /// (e.g. `xcrun devicectl device process launch --device <id> <bundle id> -run "Open Clock"`).
 /// Commands that need the board wait up to 30 s for it (and mirroring, for a run) before giving up.
 /// The URL commands exist in Debug builds only: in a release any web page could open them.
@@ -80,8 +84,28 @@ extension AppModel {
             debugCommand(host)
         case "status":
             say(statusSummary)
+        case "intent":
+            guard let prompt = arg("prompt"), !prompt.isEmpty else { return false }
+            if let old = arg("replace"), !old.isEmpty {  // intents with this name, or whose words start with it, go first
+                intents.items.filter { $0.name == old || $0.prompt.hasPrefix(old) }.forEach { intents.delete($0.id) }
+            }
+            intents.add(name: arg("name") ?? "", prompt: prompt)
+        case "line":  // iphoneagent://line?free=1: runs go out on the free line (the Manina AI key kept, off); free=0: on the key
+            Trial.shared.setKeyOn(arg("free") != "1")
+        case "callguide":  // shows the call setup guide before calls again (undoes Don't Show Again)
+            CallGuide.seen = false
         case "bench":
             debugCommand("bench", kb: Int(arg("kb") ?? "") ?? 256)
+        case "tree":
+            guard let source = arg("source").flatMap(TreeSource.init(rawValue:)) else { return false }
+            setTreeSource(source)
+        #if DEBUG
+        case "display":
+            startDisplayTrial(arg("reset") != nil ? [] : (arg("try") ?? "").split(separator: ",").compactMap {
+                let p = $0.split(separator: "x").compactMap { Int($0) }
+                return p.count == 2 ? (p[0], p[1]) : nil
+            })
+        #endif
         default:
             return false
         }
@@ -95,7 +119,7 @@ extension AppModel {
         let name = parts.first ?? "", rest = parts.count > 1 ? parts[1] : ""
         switch name {
         case "run" where !rest.isEmpty: debugCommand("run", task: rest)
-        case "calibrate", "stop", "snap": debugCommand(name)
+        case "calibrate", "stop", "snap", "manualcal": debugCommand(name)
         case "bench": debugCommand("bench", kb: Int(rest) ?? 256)
         case "status": say(statusSummary)
         case "audio": say(audio.summary + (audio.heard().isEmpty ? "" : "\n" + audio.heard()))  // the phone audio the agent hears
@@ -127,6 +151,9 @@ extension AppModel {
                 self.say("ota: installing \(release.version)")
                 self.firmware.install()
             }
+        #if DEBUG
+        case "treebench": treeBench(Int(rest) ?? 30)
+        #endif
         case "mode":
             if let mode = FrameMode(rawValue: rest) { setFrameMode(mode) } else { say("frame mode: \(FrameMode.current.rawValue)") }
         default: say("debug: unknown app command \"\(line.prefix(40))\"")
@@ -152,15 +179,21 @@ extension AppModel {
     /// One line: board, mirroring, calibration, model and run.
     var statusSummary: String {
         let s = board.status
-        let boardText = board.connected ? "connected usb \(s?.usb ?? "-") ap \(s?.ap ?? "-") sta \(s?.sta.map(String.init) ?? "-")"
+        let boardText = board.connected ? "connected input \(s?.inputState ?? "-") ap \(s?.ap ?? "-") sta \(s?.sta.map(String.init) ?? "-")"
             : "not connected"
         let mirror = feed.live ? String(format: "live %.2f", feed.aspect) : "off"
-        let cal = pointer.span.map { "\($0.w)x\($0.h) " + (pointer.quality.map { String(format: "±%.1f%%", $0 * 100) } ?? "?") }
+        let cal = pointer.absolute ? "absolute" : pointer.span.map { "\($0.w)x\($0.h) " + (pointer.quality.map { String(format: "±%.1f%%", $0 * 100) } ?? "?") }
             ?? "none"
         let model = settings.isConfigured ? (settings.currentModel ?? "auto") : "not set"
         let run = agent.running ? "running step \(agent.steps.count)" : "idle"
         return "status: frames \(FrameMode.current.rawValue); board \(boardText); mirroring \(mirror); calibration \(cal) (\(calibrator.phase)); "
             + "model \(model); run \(run); screen \(Int(DeviceScreen.size.width))x\(Int(DeviceScreen.size.height))"
+    }
+
+    /// Debug: -tree-source device|server, iphoneagent://tree?source=device (Settings › Developer › Tree source).
+    func setTreeSource(_ source: TreeSource) {
+        TreeSource.set(source)
+        say("debug: tree source \(source.rawValue) (next run)")
     }
 
     /// Launch arguments, once at startup.
@@ -188,6 +221,11 @@ extension AppModel {
             return true
         }
         if !keyed.isEmpty { say("debug: keys stored for " + keyed.map(\.title).joined(separator: ", ")) }
+        // -import-intents <file>: a .intent file copied into Documents (devicectl), imported like an opened file
+        if let name = value(after: "-import-intents"), !name.contains("/"),
+           let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            importIntents(docs.appendingPathComponent(name))
+        }
         if args.contains("-delete-intent") {
             guard args.filter({ $0 == "-delete-intent" }).count == 1,
                   let raw = value(after: "-delete-intent"), let id = UUID(uuidString: raw) else {
@@ -206,9 +244,12 @@ extension AppModel {
         if args.contains("-test-model") { Task { await pingLLM() } }
         if let dir = value(after: "-harness-ota") { harnessOTA(dir) }  // harness/fw.sh
         if let commands = value(after: "-hid") { harnessHID(commands) }  // harness/hid.sh
+        if let source = value(after: "-tree-source").flatMap(TreeSource.init(rawValue:)) { setTreeSource(source) }
+        if args.contains("-treebench") { treeBench(Int(value(after: "-treebench") ?? "") ?? 30) }
         #endif
         if let task = value(after: "-run") { debugCommand("run", task: task) }
         if args.contains("-calibrate") { debugCommand("calibrate") }
+        if args.contains("-manualcal") { debugCommand("manualcal") }  // "Tap the pointer yourself" on the board
         if args.contains("-stop") { debugCommand("stop") }
         if args.contains("-pause") || args.contains("-continue") {  // harness/ctl.sh: hold the run while the Mac looks into a step
             if !agent.running { DebugLog.write("run: not running") }
@@ -224,6 +265,25 @@ extension AppModel {
         #if DEBUG
         if let host = value(after: "-harness-host") { HarnessLink.shared.use(host: host) }  // harness/live.py's address
         #endif
+        // harness: a saved plan for an intent, from Documents/<file> {"intent": "<name>", "plan": "..."}, read back
+        if let name = value(after: "-save-plan"), !name.contains("/"),
+           let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+           let data = try? Data(contentsOf: docs.appendingPathComponent(name)),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+           let plan = json["plan"], let intent = intents.items.first(where: { $0.name == json["intent"] }) {
+            planCache.save(plan, for: intent, run: "harness")
+            say("harness: plan for \"\(intent.name)\" " + (planCache.entry(for: intent) != nil ? "saved" : "not saved"))
+        }
+        // harness: drop an intent's learned steps (by name); the next run goes to the model and learns them again
+        if let name = value(after: "-forget-steps"), var item = intents.items.first(where: { $0.name == name }) {
+            (item.steps, item.previousSteps, item.learnedFrom) = (nil, nil, nil)
+            intents.upsert(item)
+            say("harness: steps of \"\(name)\" " + ((intents.item(item.id)?.steps ?? []).isEmpty ? "forgotten" : "still there"))
+        }
+        if let v = value(after: "-ask") {  // harness: Settings › Ask before (payments / risky / never), read back
+            if let mode = AskMode(rawValue: v) { UserDefaults.standard.set(mode.rawValue, forKey: AskMode.key) }
+            say("harness: ask mode \(AskMode.current.rawValue)")
+        }
         if let lang = value(after: "-audiotest") { handleAppCommand("audiotest " + lang) }  // harness: Settings › Developer › Audio test
         if args.contains("-audio") { say(audio.summary + (audio.heard().isEmpty ? "" : "\n" + audio.heard())) }
     }
@@ -243,6 +303,9 @@ extension AppModel {
             case "calibrate":
                 guard await waitReady(mirroring: false) else { return say("debug: board not ready in 30 s") }
                 calibrator.calibrate()
+            case "manualcal":
+                guard await waitReady(mirroring: false) else { return say("debug: board not ready in 30 s") }
+                calibrator.debugManual()
             case "bench":
                 guard await waitReady(mirroring: false) else { return say("debug: board not ready in 30 s") }
                 await bench(kb: kb)
@@ -256,12 +319,11 @@ extension AppModel {
     }
 
     #if DEBUG
-    /// harness/lib.sh drops `Documents/harness-inbox/<time>.json` = ["-run", "<task>"] (launch arguments): iOS
+    /// harness/lib.sh drops `Documents/developer/harness-inbox/<time>.json` = ["-run", "<task>"] (launch arguments): iOS
     /// often restores the app for Bluetooth first, and devicectl's launch then only brings it to the front, without
     /// the arguments. Checked every second; each file is handled once and removed.
     func readHarnessInbox() {
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("harness-inbox")
+        let dir = FilesLayout.developer.appendingPathComponent("harness-inbox")
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
         for name in names.sorted() where name.hasSuffix(".json") {
             let file = dir.appendingPathComponent(name)
@@ -282,17 +344,92 @@ extension AppModel {
         HarnessLink.shared.start()
     }
 
+    /// "-treebench n" / app command "treebench n": the on-device tree (UITree) of the mirrored frame n times
+    /// ~1 s apart, at the model's 540-wide copy and at the full stream frame, then p50/p90 of total/ocr/cv ms
+    /// into debug.log. No run, no taps. Without mirroring it uses Documents/treebench/*.jpg (still frames
+    /// copied in with devicectl) and says so. cpu = the app's CPU time during a build (all its threads).
+    func treeBench(_ n: Int) {
+        Task { [weak self] in
+            guard let self else { return }
+            let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("treebench")
+            let live = await waitReady(mirroring: true, timeout: 10)
+            let streaming = feed.streamOn
+            if live && !streaming { try? await feed.stream(true) }
+            if live { _ = await feed.fresh(since: now(), timeout: 3) }
+            let stills = live ? [] : ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+                .filter { $0.pathExtension == "jpg" }.sorted { $0.path < $1.path }.compactMap { try? Data(contentsOf: $0) }
+            guard live || !stills.isEmpty else { return say("treebench: no mirroring and no Documents/treebench/*.jpg") }
+            UIApplication.shared.isIdleTimerDisabled = true  // auto-lock suspends the app mid-bench
+            defer { UIApplication.shared.isIdleTimerDisabled = false }
+            say("treebench: \(n) builds on \(live ? "live mirrored frames" : "\(stills.count) still frames (no mirroring)"), "
+                + "thermal \(ProcessInfo.processInfo.thermalState.rawValue)")
+            var stats: [String: [(tree: UITree, cpu: Double)]] = [:]
+            var idle: [Double] = []
+            for i in 0..<n {
+                guard let frame = live ? feed.frame : stills[i % stills.count] else { continue }
+                let small = ModelImage.shrink(frame)
+                for (name, jpeg) in [("model", small), ("full", frame)] where name == "model" || small != frame {
+                    let c0 = Self.cpuSeconds()
+                    let made = await Task.detached(priority: .userInitiated) { await UITree.build(jpeg: jpeg, cache: nil) }.value  // every build runs Vision
+                    let cpu = Self.cpuSeconds() - c0
+                    guard let tree = made else { continue }
+                    stats[name, default: []].append((tree, cpu))
+                    DebugLog.write("treebench \(i + 1)/\(n) \(name) " + tree.timingLine
+                                   + String(format: ", cpu %.0f ms (%.0f%% of one core)", cpu * 1000, cpu / max(tree.totalSeconds, 1e-6) * 100))
+                }
+                let c0 = Self.cpuSeconds(), t0 = now()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                idle.append((Self.cpuSeconds() - c0) / max(now() - t0, 1e-6))
+            }
+            if live && !streaming { try? await feed.stream(false) }
+            func pct(_ xs: [Double]) -> String {
+                let s = xs.sorted()
+                guard !s.isEmpty else { return "-" }
+                return String(format: "p50 %.0f p90 %.0f max %.0f", s[s.count / 2], s[min(s.count - 1, s.count * 9 / 10)], s.last!)
+            }
+            for name in ["model", "full"] {
+                guard let r = stats[name], let t = r.first?.tree else { continue }
+                say("treebench \(name) \(t.w)x\(t.h), \(r.count) builds: total \(pct(r.map { $0.tree.totalSeconds * 1000 })) ms; "
+                    + "ocr \(pct(r.map { $0.tree.ocrSeconds * 1000 })); cv \(pct(r.map { $0.tree.cvSeconds * 1000 })); "
+                    + "elements \(pct(r.map { Double($0.tree.elements.count) })); "
+                    + "compact \(pct(r.map { Double($0.tree.candidates.filter { $0.role != "container" }.count) })); "
+                    + "cpu ms \(pct(r.map { $0.cpu * 1000 }))")
+            }
+            say("treebench: done; idle app cpu between builds \(pct(idle.map { $0 * 100 }))% of one core, "
+                + "thermal \(ProcessInfo.processInfo.thermalState.rawValue)")
+        }
+    }
+
+    /// The app's CPU time so far (user + system, all threads).
+    nonisolated static func cpuSeconds() -> Double {
+        var u = rusage()
+        getrusage(RUSAGE_SELF, &u)
+        return Double(u.ru_utime.tv_sec + u.ru_stime.tv_sec) + Double(u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6
+    }
+
     /// Raw board commands ("key ctrl+space; type abc"), one after another, each reply logged: harness experiments.
     private func harnessHID(_ commands: String) {
         Task { [weak self] in
             guard let self else { return }
-            guard await waitReady(mirroring: false) else { return say("harness hid: board not ready in 30 s") }
+            // `hidmode` (a --dual-hid board) needs only the link: in BLE mode before the pointer pairs, the input
+            // is never ready, and this is how it goes back to USB.
+            if commands.hasPrefix("hidmode") {
+                let deadline = now() + 30
+                while !board.connected && now() < deadline { try? await Task.sleep(nanoseconds: 500_000_000) }
+                guard board.connected else { return say("harness hid: board not ready in 30 s") }
+            } else {
+                guard await waitReady(mirroring: false) else { return say("harness hid: board not ready in 30 s") }
+            }
             var moved = false
             for command in commands.split(separator: ";").map({ $0.trimmingCharacters(in: .whitespaces) }) where !command.isEmpty {
                 let reply: String
                 if command.hasPrefix("wait "), let s = Double(command.dropFirst(5)) {  // "wait 1.2": seconds
                     try? await Task.sleep(nanoseconds: UInt64(s * 1e9))
                     reply = "ok"
+                } else if command == "homeup" || command.hasPrefix("homeup ") {  // HomeTuning for this orientation
+                    let landscape = DeviceScreen.size.width > DeviceScreen.size.height
+                    if let n = Int(command.dropFirst(7)) { HomeTuning.store(n, landscape: landscape) }
+                    reply = "home pushes up \(HomeTuning.value(landscape: landscape)) (\(landscape ? "landscape" : "portrait"))"
                 } else if command == "gop" {  // the board's GOP buffer: bytes, overflows, frozen for us
                     let st = board.status
                     reply = "gop \(st?.gop.map(String.init) ?? "?") B, overflows \(st?.ovf.map(String.init) ?? "?"), frozen \(st?.fz.map(String.init) ?? "?")"
@@ -308,8 +445,8 @@ extension AppModel {
                     } else { reply = "err not found" }
                 } else if command == "shot" {  // the mirrored screen now, for harness/hid.sh to pull
                     await feed.settled(most: 1.5)
-                    let name = "harness-shots/\(Int(Date().timeIntervalSince1970)).jpg"
-                    let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(name)
+                    let name = "harness-shots/\(Int(Date().timeIntervalSince1970)).jpg"  // in Documents/developer
+                    let url = FilesLayout.developer.appendingPathComponent(name)
                     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                     reply = (try? feed.frame?.write(to: url)) != nil ? "saved " + name : "err no frame"
                     if let jpeg = feed.frame { HarnessLink.shared.sendFile(name, jpeg) }  // harness/live.py saves it
@@ -334,9 +471,47 @@ extension AppModel {
         let deadline = now() + timeout
         while now() < deadline {
             let s = board.status
-            if board.connected && s?.usb == "ok" && (!mirroring || s?.ap == "streaming") { return true }
+            if board.connected && s?.inputReady == true && (!mirroring || s?.ap == "streaming") { return true }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         return false
     }
 }
+
+#if DEBUG
+extension AppModel {
+    /// Which stream iOS sends for an advertised AirPlay display: the board's size is set now, and each new mirroring
+    /// session logs what arrived (frames, AirPlay rate, the board's GOP and heap) after 12 s, then moves on to the next
+    /// size; after the last, back to the default. The display applies from the next Screen Mirroring start.
+    func startDisplayTrial(_ sizes: [(w: Int, h: Int)]) {
+        displayTrials = Array(sizes.dropFirst())
+        DeviceCaps.mirrorDisplayOverride = sizes.first
+        let want = DeviceCaps.mirrorDisplay
+        DebugLog.write(sizes.isEmpty ? "display test: off, back to \(want.w)x\(want.h)"
+                       : "display test: advertising \(want.w)x\(want.h); restart Screen Mirroring (\(sizes.count) size(s) to go)")
+        mirrorDisplayAsked = false
+        if let s = board.status {
+            if sizes.isEmpty, !DeviceKind.isPad, s.w != want.w || s.h != want.h {  // an iPhone back to its default
+                Task { _ = try? await board.commands.send("res \(want.w) \(want.h)") }
+            } else {
+                matchMirrorDisplay(s)
+            }
+        }
+    }
+
+    /// A mirroring session started: during a test, report it once the stream has run a while, then go on.
+    func displayTrialSession() {
+        guard let tried = DeviceCaps.mirrorDisplayOverride else { return }
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            guard let self, DeviceCaps.mirrorDisplayOverride.map({ $0 == tried }) == true else { return }
+            let s = self.board.status
+            DebugLog.write("display test: advertised \(tried.w)x\(tried.h) -> frames \(Int(self.feed.size.width))x\(Int(self.feed.size.height)), "
+                + String(format: "AirPlay %.0f kbps %.1f fps, GOP %d KB, heap %d KB, overflows %d", s?.kbps ?? 0, s?.fps ?? 0,
+                         (s?.gop ?? 0) / 1024, (s?.heap ?? 0) / 1024, s?.ovf ?? 0)
+                + ", screen \(Int(DeviceScreen.size.width))x\(Int(DeviceScreen.size.height)) pt")
+            self.startDisplayTrial(self.displayTrials)
+        }
+    }
+}
+#endif

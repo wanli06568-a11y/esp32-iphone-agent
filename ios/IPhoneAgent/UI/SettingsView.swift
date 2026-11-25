@@ -7,13 +7,15 @@ struct SettingsView: View {
     @ObservedObject var settings: Settings
     @ObservedObject var board: BoardLink
     @AppStorage(AskMode.key) private var askMode = AskMode.current
+    @AppStorage(Pointer.gentleHomeKey) private var gentleHome = true
+    @AppStorage("blurScreens") private var blurScreens = true
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
                     NavigationLink { ModelSettingsView(app: app, settings: settings) } label: {
-                        row("Model", "brain", .pink, value: app.modelReady ? (MockMode.on ? "Demo" : settings.currentModel ?? String(localized: "Auto")) : nil)
+                        row("Model", "brain", .pink, value: app.modelReady ? modelName : nil)
                     }
                     NavigationLink { BoardSettingsView(app: app, board: board) } label: {
                         row("Board", "cable.connector", .blue,
@@ -29,7 +31,7 @@ struct SettingsView: View {
                     }
                     .tint(.primary)
                 } footer: {
-                    Text("ESP32 Agent follows your iPhone's language. To change it just for this app, open Settings › ESP32 Agent › Language.")
+                    Text("\(AppName.current) follows your iPhone's language. To change it just for this app, open Settings › \(AppName.current) › Language.")
                 }
                 Section {
                     Button { UIApplication.shared.open(URL(string: UIApplication.openNotificationSettingsURLString)!) } label: {
@@ -43,6 +45,15 @@ struct SettingsView: View {
                     NavigationLink { MemoryView(store: MemoryStore.shared) } label: {
                         row("Memory", "brain.head.profile", .teal, value: "\(MemoryStore.shared.entries.count)")
                     }
+                    Button { CallGuide.shared.pending = CallGuide.Pending(task: nil, intent: nil) } label: {
+                        HStack {
+                            SettingsLabel(title: "Phone Calls", symbol: "phone.fill", color: .green)
+                            BetaBadge()
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                        }
+                    }
+                    .tint(.primary)
                     Picker(selection: $askMode) {
                         ForEach(AskMode.allCases) { Text($0.title).tag($0) }
                     } label: {
@@ -51,7 +62,53 @@ struct SettingsView: View {
                 } header: {
                     Text("Runs")
                 } footer: {
-                    Text("Ask me first: the agent stops and asks you in a notification before paying (Payments only), or also before sending a message, deleting or changing account settings. Every run keeps a low-frame-rate video of the mirrored screen for the review.")
+                    Text("Ask me first: the agent always stops and asks you in a notification before a step that can't be undone, such as deleting for good, approving a request, a phone call or accepting terms. It also asks before paying, and with the widest choice before sending a message. Every run keeps a low-frame-rate video of the mirrored screen for the review.")
+                }
+                Section {
+                    Toggle(isOn: $settings.restoreKeyboardAfterRun) {
+                        SettingsLabel(title: "Restore on-screen keyboard after runs", symbol: "keyboard", color: .blue)
+                    }
+                    Toggle(isOn: $gentleHome) {
+                        SettingsLabel(title: "Gentle Home swipe", symbol: "arrow.up.to.line", color: .gray)
+                    }
+                    Toggle(isOn: $settings.learnFromRuns) {
+                        SettingsLabel(title: "Intents learn from runs", symbol: "wand.and.stars", color: .indigo)
+                    }
+                    Toggle(isOn: $settings.standbyIsland) {
+                        SettingsLabel(title: "Standby in Dynamic Island", symbol: "capsule", color: .blue)
+                    }
+                    .onValueChange(of: settings.standbyIsland) { app.refreshStandby() }
+                    Toggle(isOn: $blurScreens) {
+                        SettingsLabel(title: "Blur screens in reviews", symbol: "eye.slash", color: .gray)
+                    }
+                } footer: {
+                    Text("The model checks a screenshot when a run ends. If it restores the keyboard, it checks a second screenshot. Gentle Home swipe: the swipe up to the Home Screen at a run's start goes at half the board's top speed. Intents learn from runs: when an intent's saved steps miss and the AI finishes the task, that run's steps replace them; Wrong on the finished run undoes it. Blur screens in reviews: a review's screenshots stay blurred until you tap one, so chats and messages do not show in a screen recording.")
+                    + Text(verbatim: " ") + Text("Standby in Dynamic Island: between runs the island shows your three most used intents and New Task; an intent tapped there runs on the app you are in.")
+                }
+                Section {
+                    Toggle(isOn: $settings.unattendedMode) {
+                        SettingsLabel(title: "Unattended", symbol: "moon.zzz.fill", color: .indigo)
+                    }
+                    Toggle(isOn: $settings.speculativeLook) {
+                        SettingsLabel(title: "Look ahead", symbol: "hare", color: .orange)
+                    }
+                    Button { Task { await app.learnMirrorSpots() } } label: {
+                        HStack {
+                            SettingsLabel(title: "Learn Screen Mirroring taps", symbol: "rectangle.on.rectangle", color: .blue)
+                            Spacer()
+                            Text(MirrorSpots.load()?.validNow == true ? "Learned" : "Not learned")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .tint(.primary)
+                } header: {
+                    Text("Unattended")
+                } footer: {
+                    Text("Unattended: a run keeps going when you don't answer. Help and confirm prompts wait two minutes, then skip or stop. A risky step is never approved on its own, and a passcode is never typed. A dropped link is recovered for up to two hours instead of ending the run. Shortcuts can turn this on for one run with the Unattended parameter.")
+                    + Text(verbatim: " ")
+                    + Text("Learn Screen Mirroring taps while mirroring is on and Control Center can be opened. The app remembers the Screen Mirroring button and the board's row for this screen size and iOS version, and uses them only while Unattended is on. It never taps Stop Mirroring while learning.")
+                    + Text(verbatim: " ")
+                    + Text("Before a long run: plug in the iPhone, turn off Low Power Mode, set Auto-Lock to Never, and turn on a Focus so notifications don't cover the screen. Auto-Lock can't be read by the app. Look ahead starts the next model request once the screen is nearly still. It is off by default; a request is thrown away if the screen then changes, and the gesture is checked against a fresh frame before it is sent.")
                 }
                 ListenSection(app: app, audio: app.audio)
                 Section {
@@ -79,6 +136,15 @@ struct SettingsView: View {
         }
     }
 
+    /// What the user picked, never the free line's internal model id (handsy-qwen).
+    private var modelName: String {
+        if MockMode.on { return "Demo" }
+        if settings.provider == .handsyTrial {
+            return Trial.shared.keyed ? String(localized: "Manina AI Plan") : ModelProvider.handsyTrial.title
+        }
+        return settings.currentModel ?? String(localized: "Auto")
+    }
+
     private func row(_ title: LocalizedStringKey, _ symbol: String, _ color: Color, value: String?) -> some View {
         HStack {
             SettingsLabel(title: title, symbol: symbol, color: color)
@@ -88,13 +154,19 @@ struct SettingsView: View {
     }
 }
 
-/// Settings › Developer: demo data, and checks that need no other app (the phone audio round trip).
+/// Settings › Developer: demo data, the remote debug log, and checks that need no other app (the phone audio round trip).
 struct DeveloperView: View {
     @ObservedObject var app: AppModel
     @ObservedObject var audio: AudioFeed
     @AppStorage(MockMode.key) private var demoData = false
+    @AppStorage(FilesLayout.developerKey) private var developerFiles = false
+    @AppStorage(TreeSource.key) private var treeSource = TreeSource.fallback.rawValue
     @State private var language = "ja-JP"
     @State private var testing = false
+    @State private var callNumber = ""
+    @State private var callLine = "Hello, this is a call test. Can you hear me?"
+    @AppStorage("callTestCaptions") private var captionsAt = "707 820"  // Control Center spots, 0-1000; empty = by name
+    @AppStorage("callTestSpeech") private var speechAt = "290 820"
 
     var body: some View {
         List {
@@ -103,6 +175,41 @@ struct DeveloperView: View {
             } footer: {
                 Text("Demo data fakes a board, a finished run and the whole setup, to try the app without hardware. Takes effect after you quit and reopen the app.")
             }
+            Section {
+                Toggle(isOn: $developerFiles) {
+                    SettingsLabel(title: "Show developer files", symbol: "hammer", color: .gray)
+                }
+            } footer: {
+                Text("The Files tab also lists the app's own data (runs, chats, intent screens) and test tools. Deleting those can break runs and intents.")
+            }
+            #if DEBUG
+            Section {
+                Picker(selection: $treeSource) {
+                    Text(verbatim: "Server (Spark)").tag(TreeSource.server.rawValue)
+                    Text(verbatim: "On-device").tag(TreeSource.device.rawValue)
+                } label: { Text(verbatim: "Tree source") }
+            } footer: {
+                Text(verbatim: "Free line: where the screen tree for the actor is built. Takes effect on the next run.")
+            }
+            Section {
+                TextField(text: $callNumber) { Text(verbatim: "Number to call") }.keyboardType(.phonePad)
+                TextField(text: $callLine) { Text(verbatim: "Line to say") }
+                TextField(text: $captionsAt) { Text(verbatim: "Live Captions at (x y, empty = by name)") }
+                TextField(text: $speechAt) { Text(verbatim: "Live Speech at (x y, empty = by name)") }
+                Button {
+                    let test = Calls.test(number: callNumber, line: callLine, captions: spot(captionsAt), speech: spot(speechAt))
+                    Task { await app.run(test.prompt, intent: test) }
+                } label: {
+                    Text(verbatim: "Run call test")
+                }
+                .disabled(callNumber.filter(\.isNumber).count < 3 || callLine.isEmpty)
+            } header: {
+                Text(verbatim: "Call test")
+            } footer: {
+                Text(verbatim: "Debug builds only. Before: Live Speech and Live Captions on (Settings › Accessibility), Live Speech in Control Center, Listen to phone audio on. Steps: dial, you answer on the other phone, open Live Speech, say the line, you reply, read the reply, hang up. Each step is in the run's trace.")
+            }
+            #endif
+            RemoteLogSection()
             Section {
                 Picker("Phrase", selection: $language) {
                     ForEach(AudioTest.phrases.keys.sorted(), id: \.self) { Text(verbatim: SpeechLanguages.name($0)).tag($0) }
@@ -130,6 +237,94 @@ struct DeveloperView: View {
         }
         .navigationTitle("Developer")
     }
+
+    /// "809 606" → a 0-1000 spot; anything else → nil (found by name).
+    private func spot(_ text: String) -> (x: Int, y: Int)? {
+        let n = text.split(whereSeparator: { $0 == " " || $0 == "," }).compactMap { Int($0) }
+        return n.count == 2 ? (n[0], n[1]) : nil
+    }
+}
+
+extension BoardSettingsView {
+    /// A board that carries both inputs (--dual-hid): USB or Bluetooth mouse and keyboard. Switching restarts it.
+    @ViewBuilder func inputSection(_ mode: String) -> some View {
+        Section {
+            Picker("Input", selection: Binding(get: { inputSwitch ?? mode }, set: { if $0 != mode { inputAsk = $0 } })) {
+                Text("USB").tag("usb")
+                Text("Bluetooth").tag("ble")
+            }
+            .disabled(inputSwitch != nil || !board.connected)
+            if inputSwitch != nil {
+                HStack { Text("Restarting the board…"); Spacer(); ProgressView() }
+            }
+            if let inputError { Text(inputError).font(.footnote).foregroundStyle(.red) }
+        } header: {
+            Text("Input")
+        } footer: {
+            Text(mode == "ble"
+                 ? "The board is a Bluetooth mouse and keyboard: pair it once in Settings › Accessibility › Touch › AssistiveTouch › Devices › Bluetooth Devices. Its USB-C port only powers it."
+                 : "The board is this \(DeviceKind.name)'s USB mouse and keyboard: plug it into its USB-C port.")
+        }
+        .confirmationDialog(inputAsk == "ble" ? "Use Bluetooth for the mouse?" : "Use USB for the mouse?",
+                            isPresented: Binding(get: { inputAsk != nil }, set: { if !$0 { inputAsk = nil } }),
+                            titleVisibility: .visible) {
+            Button("Switch") { if let target = inputAsk { switchInput(to: target) } }
+            Button("Cancel", role: .cancel) { inputAsk = nil }
+        } message: {
+            Text("The board restarts and reconnects in a few seconds. Start Screen Mirroring again afterwards.")
+        }
+        .onValueChange(of: board.status?.hidm) { _, now in
+            if let target = inputSwitch, now == target { inputSwitch = nil }
+        }
+    }
+
+    private func switchInput(to target: String) {
+        inputAsk = nil
+        inputError = nil
+        inputSwitch = target
+        bluetoothSteps = target == "ble"
+        Task {
+            do {
+                try await BluetoothSteps.switchInput(to: target, on: board)
+                try? await Task.sleep(nanoseconds: 45_000_000_000)  // restarts in ~5 s; give up waiting after 45
+                if inputSwitch == target { inputSwitch = nil }
+            } catch {
+                inputSwitch = nil
+                bluetoothSteps = false
+                inputError = String(localized: "The board did not switch: \(error.localizedDescription)")
+            }
+        }
+    }
+}
+
+/// What to do after the board switches to Bluetooth, shown once right after the switch (Settings or setup). Each
+/// step ticks itself from the status: the board back with `hidm` ble, mirroring on, and `hid` ok once iOS pairs the
+/// Bluetooth mouse (the app's own connection stays paired through the restart).
+struct BluetoothSteps: View {
+    @ObservedObject var board: BoardLink
+
+    static func switchInput(to target: String, on board: BoardLink) async throws {
+        DebugLog.write("board input: switching to \(target)")
+        _ = try await board.commands.send("hidmode \(target)")
+    }
+
+    var body: some View {
+        let s = board.connected ? board.status : nil
+        let back = s?.hidm == "ble"
+        let mirroring = back && s?.ap == "streaming"  // after the restart, not the old session
+        let mouse = back && s?.hid == "ok"
+        let name = board.name.isEmpty ? BoardName.current : board.name
+        VStack(alignment: .leading, spacing: 0) {
+            CheckRow(title: "The board restarts as a Bluetooth mouse", done: back, active: !back, waiting: !back,
+                     detail: "Power it from any USB charger: it no longer needs this \(DeviceKind.name)'s port.")
+            Divider().padding(.vertical, Space.s)
+            CheckRow(title: "Start Screen Mirroring again", done: mirroring, active: back && !mirroring,
+                     detail: mirroring ? nil : "Swipe down from the top-right corner and tap Screen Mirroring › \(BoardName.current).")
+            Divider().padding(.vertical, Space.s)
+            CheckRow(title: "Pair the Bluetooth mouse", done: mouse, active: back && !mouse, waiting: back && !mouse,
+                     detail: mouse ? nil : "In Settings › Accessibility › Touch, turn on AssistiveTouch, then under Devices › Bluetooth Devices tap \(name). Once per \(DeviceKind.name); the app itself stays paired.")
+        }
+    }
 }
 
 /// Settings › Model: base URL and key (placeholders only), Test Connection, and an Advanced disclosure with
@@ -137,6 +332,12 @@ struct DeveloperView: View {
 struct BoardSettingsView: View {
     @ObservedObject var app: AppModel
     @ObservedObject var board: BoardLink
+    @State private var lanSheet = false
+    @State private var inputAsk: String?       // usb | ble, waiting for the confirmation
+    @State private var inputSwitch: String?    // usb | ble, sent; the board restarts into it
+    @State private var inputError: String?
+    @State private var bluetoothSteps = false  // switched to Bluetooth here: the steps after it, ticked as they happen
+    @State private var stuck = false  // not connected for a while: BoardRepairHint
 
     var body: some View {
         List {
@@ -144,17 +345,19 @@ struct BoardSettingsView: View {
                 HStack(spacing: Space.l) {
                     AgentFace(mood: board.connected ? .idle : .sleeping).frame(width: 52, height: 58)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(verbatim: board.name.isEmpty ? "ESP32 Agent" : board.name).font(.headline)
+                        Text(verbatim: board.name.isEmpty ? BoardName.current : board.name).font(.headline)
                         Text(board.connected ? "Connected" : board.pairedID != nil ? "Connecting…" : "Not paired")
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                 }
                 .padding(.vertical, Space.xs)
                 if board.connected, let s = board.status {
-                    ValueRow(title: "Mouse", value: s.usb ?? "–")
+                    ValueRow(title: "Mouse", value: s.inputState ?? "–")
                     ValueRow(title: "Mirroring", value: s.ap ?? "–")
                 }
             }
+            if let mode = board.status?.hidm, board.connected || inputSwitch != nil { inputSection(mode) }
+            if bluetoothSteps { Section { BluetoothSteps(board: board) } }
             if board.pairedID == nil || !board.connected {
                 Section {
                     ForEach(board.found.filter { $0.id != board.pairedID }) { f in
@@ -170,44 +373,69 @@ struct BoardSettingsView: View {
                         }
                     }
                     .disabled(board.scanning)
+                    BoardRepairHint(board: board, stuck: stuck)
                 } header: {
                     Text("Nearby")
                 }
             }
             Section {
-                Button { app.startJoin() } label: {
-                    HStack {
-                        Text("Join the Board's Wi-Fi")
-                        Spacer()
-                        if app.join.busy { ProgressView() }
+                if app.networkSwitched && board.status?.ap != "streaming" { MirroringRestartHint(app: app) }
+                if app.lanMode {
+                    ValueRow(title: "Mode", value: String(localized: "Home Wi-Fi (LAN)"))
+                    if let ssid = app.lanSSID ?? board.net?.ssid { ValueRow(title: "Network", value: ssid) }
+                    Button { lanSheet = true } label: { Text("Change Wi-Fi Network…") }
+                        .disabled(!board.connected || app.lanJoin.busy)
+                    Button { app.switchToHotspot() } label: {
+                        HStack {
+                            Text("Switch Back to the Board's Hotspot")
+                            Spacer()
+                            if app.lanJoin.busy { ProgressView() }
+                        }
                     }
-                }
-                .disabled(app.join.busy)
-                if let ssid = app.hotspotSSID { ValueRow(title: "Network", value: ssid) }
-                if let net = app.manualHotspot, let pass = net.pass {
-                    if let ssid = net.ssid { ValueRow(title: "Network", value: ssid) }
-                    ValueRow(title: "Password", value: pass)
-                    Button { UIPasteboard.general.string = pass; Haptics.success() } label: { Text("Copy Wi-Fi Password") }
-                    Button { UIPasteboard.general.string = pass; Hotspot.openWiFiSettings() } label: { Text("Open Settings") }
+                    .disabled(!board.connected || app.lanJoin.busy)
+                } else {
+                    Button { app.startJoin() } label: {
+                        HStack {
+                            Text("Join the Board's Wi-Fi")
+                            Spacer()
+                            if app.join.busy { ProgressView() }
+                        }
+                    }
+                    .disabled(app.join.busy)
+                    if let ssid = app.hotspotSSID { ValueRow(title: "Network", value: ssid) }
+                    if let net = app.manualHotspot, let pass = net.pass {
+                        if let ssid = net.ssid { ValueRow(title: "Network", value: ssid) }
+                        ValueRow(title: "Password", value: pass)
+                        Button { UIPasteboard.general.string = pass; Haptics.success() } label: { Text("Copy Wi-Fi Password") }
+                        Button { UIPasteboard.general.string = pass; Hotspot.openWiFiSettings() } label: { Text("Open Settings") }
+                    }
+                    Button { lanSheet = true } label: { Text("Use a Home Wi-Fi Network Instead…") }
+                        .disabled(!board.connected || app.lanJoin.busy)
                 }
             } header: {
                 Text("Wi-Fi")
             } footer: {
-                Text("Turn off Personal Hotspot before joining. While joined, the internet goes over cellular data. Switch back in Settings › Wi-Fi when you are done.")
+                if app.lanMode {
+                    Text("The board and this device share your Wi-Fi network. If the board stops showing up in Screen Mirroring, the router may isolate devices from each other or block mDNS — switch back to the board's hotspot.")
+                } else {
+                    Text("Turn off Personal Hotspot before joining. While joined, the internet goes over cellular data. Switch back in Settings › Wi-Fi when you are done.")
+                }
             }
+            .sheet(isPresented: $lanSheet) { LanSheet(app: app) }
             FirmwareSection(app: app, updater: app.firmware, board: board)
             if board.pairedID != nil {
                 Section {
                     Button("Unpair Board", role: .destructive) { Task { await board.unpair() } }
                     Button("Forget in This App", role: .destructive) { board.forget() }
                 } footer: {
-                    Text("Unpair erases the bonds on the board. iOS keeps its own: also tap (i) next to \"ESP32 Agent\" in Settings › Bluetooth and choose Forget This Device.")
+                    Text("Unpair erases the bonds on the board. iOS keeps its own: also tap (i) next to \"\(BoardName.current)\" in Settings › Bluetooth and choose Forget This Device.")
                 }
             }
         }
         .navigationTitle("Board")
         .navigationBarTitleDisplayMode(.inline)
         .task { await app.refreshHotspot() }
+        .task(id: board.connected) { stuck = false; stuck = await BoardRepairHint.wait(connected: board.connected) }
     }
 }
 
@@ -225,7 +453,10 @@ struct CalibrationRow: View {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Calibration")
-                        if let span = pointer.span {
+                        if pointer.absolute {
+                            Text("Absolute mouse: no calibration needed")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else if let span = pointer.span {
                             Text(verbatim: "\(pointer.quality.map(CalibrationText.percent) ?? "–") · \(span.w) × \(span.h)")
                                 .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                         }

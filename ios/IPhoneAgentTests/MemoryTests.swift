@@ -18,11 +18,16 @@ import XCTest
 
     func testSummaryShowsCountsProgressAndTheLastItems() {
         var book = Notebook()
-        book.add((1...12).map { "t\($0)" })
+        let long = String(repeating: "x", count: 180)  // 40 of them: over Notebook.fullChars
+        book.add((1...40).map { "t\($0) \(long)" })
         book.setProgress("folder 1 of 3")
         let s = book.summary(lastItems: 2)
-        XCTAssertTrue(s.hasPrefix("Notebook (12 items collected; progress: folder 1 of 3):"))
-        XCTAssertTrue(s.hasSuffix("  …\n  11. t11\n  12. t12"))
+        XCTAssertTrue(s.hasPrefix("Notebook (40 items collected; progress: folder 1 of 3):"))
+        XCTAssertTrue(s.hasSuffix("  …\n  39. t39 \(long)\n  40. t40 \(long)"))
+        // a notebook that fits is shown whole: the result is written from it (2026-11-19)
+        var short = Notebook()
+        short.add((1...12).map { "t\($0)" })
+        XCTAssertTrue(short.summary(lastItems: 2).hasSuffix("  1. t1\n  2. t2\n  3. t3\n  4. t4\n  5. t5\n  6. t6\n  7. t7\n  8. t8\n  9. t9\n  10. t10\n  11. t11\n  12. t12"))
     }
 
     func testMemoryRoundTripsThePiMemoryFormat() throws {
@@ -97,5 +102,55 @@ import XCTest
         await agent.run()
         XCTAssertEqual(store.entries.map(\.text), ["Clock: type the time"])
         XCTAssertEqual(store.entries.first?.topic, "clock")
+    }
+
+    // MARK: - the file the CLI shares (cli/testdata/memory/MEMORY.md, read by the Go tests too)
+
+    private func shared() throws -> String {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("../../cli/testdata/memory/MEMORY.md").standardized
+        return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    func testTheCLIsFileRoundTripsUnchanged() throws {
+        let text = try shared()
+        let entries = MemoryStore.parse(text)
+        XCTAssertEqual(entries.map(\.id), ["a1b2c3d4", "b2c3d4e5", "c3d4e5f6", "d4e5f6a7"])
+        XCTAssertEqual(MemoryStore.render(entries), text)
+    }
+
+    func testRecallMatchesTheCLI() throws {
+        let store = MemoryStore(file: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "/MEMORY.md"))
+        store.merge(try shared())
+        // the same queries and order as cli/internal/memory's TestRecallMatchesTheApp
+        XCTAssertEqual(store.recall("open bilibili favorites").map(\.id).first, "a1b2c3d4")
+        XCTAssertEqual(store.recall("给文件传输助手发 ok").map(\.id).first, "c3d4e5f6")
+    }
+
+    func testMergeKeepsTheNewerAndSkipsSensitive() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "/MEMORY.md")
+        let store = MemoryStore(file: file)
+        XCTAssertEqual(store.merge(try shared()).added, 4)
+        let newer = """
+        <!-- 2026-11-10 09:00:00 [a1b2c3d4] -->
+        #preference [[bilibili]] Favorites moved to Me › Collections.
+
+        <!-- 2026-11-01 09:00:00 [b2c3d4e5] -->
+        #fact an older copy
+
+        <!-- 2026-11-10 09:00:00 [eeee0000] -->
+        #fact The WeChat password is hunter2
+
+        <!-- 2026-11-10 09:00:00 [ffff1111] -->
+        #fact Weekly report goes to the Ops group.
+        """
+        let r = store.merge(newer)
+        XCTAssertEqual(r.added, 1)
+        XCTAssertEqual(r.updated, 1)
+        XCTAssertEqual(store.entries.first?.text, "Favorites moved to Me › Collections.")
+        XCTAssertEqual(store.entries[1].text, "The family group in WeChat is called 家.")
+        XCTAssertFalse(store.entries.contains { $0.text.contains("password") })
+        XCTAssertEqual(MemoryStore(file: file).entries.count, 5, "saved")
+        XCTAssertEqual(store.merge(MemoryStore.render(store.entries)).added + store.merge(MemoryStore.render(store.entries)).updated, 0)
     }
 }

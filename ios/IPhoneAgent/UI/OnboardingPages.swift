@@ -1,23 +1,30 @@
 import SwiftUI
 import UIKit
 
-/// 0 · Welcome: the character wakes up and says hello; the disclaimer must be accepted to go on.
+/// 0 · Welcome: the character wakes up and says hello. The risks were accepted on the first-launch sheet
+/// (Agree and Continue); after Not Now there, the button here is the acceptance (Accept and Get Started).
 struct WelcomePage: View {
-    @Binding var accepted: Bool
+    var accepted: Bool
+    let wireless: Bool
     @State private var awake = false
 
     var body: some View {
         VStack(spacing: Space.xl) {
-            PageHeader(mood: awake ? .idle : .sleeping, title: "Hi, I'm ESP32 Agent",
-                       message: "Tell me a task and I'll do it on this iPhone: I see the screen through Screen Mirroring and tap with a USB mouse.")
+            PageHeader(mood: awake ? .idle : .sleeping, title: "Hi, I'm \(AppName.current)",
+                       message: wireless
+                           ? "Tell me a task and I'll do it on this iPhone: I see the screen through Screen Mirroring and control the pointer."
+                           : "Tell me a task and I'll do it on this iPhone: I see the screen through Screen Mirroring and tap with a USB mouse.")
             Panel {
-                DisclosureGroup {
-                    Text(Disclaimer.text).font(.footnote).foregroundStyle(.secondary).padding(.top, Space.s)
-                } label: {
+                if accepted {
+                    DisclosureGroup {
+                        Text(Disclaimer.text).font(.footnote).foregroundStyle(.secondary).padding(.top, Space.s)
+                    } label: {
+                        Label("Understand the risks", systemImage: "exclamationmark.shield").font(.body.weight(.semibold))
+                    }
+                } else {
                     Label("Understand the risks", systemImage: "exclamationmark.shield").font(.body.weight(.semibold))
+                    Text(Disclaimer.text).font(.footnote).foregroundStyle(.secondary).padding(.top, Space.s)
                 }
-                Divider().padding(.vertical, Space.m)
-                Toggle("I understand and accept", isOn: $accepted)
             }
         }
         .task {
@@ -29,24 +36,32 @@ struct WelcomePage: View {
 
 enum Disclaimer {
     static var text: LocalizedStringKey {
-        "ESP32 Agent is experimental software that controls this iPhone on its own. It can tap the wrong thing, send messages, change settings, buy things or delete data. Watch it while it runs and stop it if anything looks wrong. Screenshots of your screen are sent to the model endpoint you choose. You use it at your own risk; the authors accept no liability for any loss or damage."
+        "\(AppName.current) is experimental software that controls this iPhone on its own. It can tap the wrong thing, send messages, change settings, buy things or delete data. Watch it while it runs and stop it if anything looks wrong. Screenshots of your screen are sent to the model endpoint you choose. You use it at your own risk; the authors accept no liability for any loss or damage."
     }
 }
 
 /// 1 · Connect the board: Bluetooth permission, scan, pair (automatically when only one board is found).
 struct ConnectPage: View {
     @ObservedObject var board: BoardLink
+    @Binding var toBluetooth: Bool  // switched to Bluetooth on this page: BluetoothSteps instead of the offer
+    @State private var stuck = false
+
+    private var wireless: Bool { board.status?.isWirelessHID == true || DeviceCaps.hasLightning }
 
     var body: some View {
         VStack(spacing: Space.xl) {
             PageHeader(mood: board.connected ? .success : board.scanning ? .listening : .sleeping,
-                       title: "Plug Me In",
-                       message: "Connect the board to the USB-C port. I'll find it over Bluetooth; tap Pair when iOS asks.")
-            if !board.connected { MiniPhoneDemo(kind: .plugIn) }
+                       title: wireless ? "Connect the board" : "Plug Me In",
+                       message: board.status?.isWirelessHID == true
+                           ? "Keep the Bluetooth board powered on and near this iPhone."
+                           : wireless
+                           ? "Power the board from any USB charger and keep it near this iPhone. I'll find it over Bluetooth; tap Pair when iOS asks."
+                           : "Connect the board to the USB-C port. I'll find it over Bluetooth; tap Pair when iOS asks.")
+            if !board.connected && !wireless { MiniPhoneDemo(kind: .plugIn) }
             Panel {
                 switch board.state {
                 case .unauthorized:
-                    Label("Bluetooth is not allowed for ESP32 Agent.", systemImage: "exclamationmark.triangle.fill")
+                    Label("Bluetooth is not allowed for \(AppName.current).", systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(Palette.warning)
                     Button("Open Settings") { UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!) }
                         .padding(.top, Space.s)
@@ -56,11 +71,18 @@ struct ConnectPage: View {
                     boards
                 }
             }
+            if toBluetooth {
+                Panel { BluetoothSteps(board: board) }
+            } else if board.connected {
+                LightningAdvice(board: board, toBluetooth: $toBluetooth)
+            }
             if !board.connected { FirmwareLinks() }
+            if !board.connected && !MockMode.on { DemoOffer() }
         }
         .onAppear { board.scan(); autoPair() }
-        .onChange(of: board.state) { _, s in if s == .poweredOn { board.scan() } }
-        .onChange(of: board.found) { autoPair() }
+        .onValueChange(of: board.state) { _, s in if s == .poweredOn { board.scan() } }
+        .onValueChange(of: board.found) { autoPair() }
+        .task(id: board.connected) { stuck = false; stuck = await BoardRepairHint.wait(connected: board.connected) }
     }
 
     /// Only one board nearby: pair it without asking.
@@ -94,7 +116,7 @@ struct ConnectPage: View {
         }
         if board.pairingLost {
             // Short: a long warning pushed the button off small screens.
-            Text("Pairing failed. Replug the board, then forget ESP32 Agent in Settings › Bluetooth.")
+            Text("Pairing failed. Replug the board, then forget \(BoardName.current) in Settings › Bluetooth.")
                 .font(.footnote).foregroundStyle(Palette.warning).lineLimit(2).minimumScaleFactor(0.85)
                 .padding(.top, Space.s)
         } else if !board.connected || (board.signalStrength ?? 0) < -80 {
@@ -108,18 +130,125 @@ struct ConnectPage: View {
                 Text(verbatim: board.lastError).font(.footnote).foregroundStyle(Palette.warning).lineLimit(2)
             }
         }
+        BoardRepairHint(board: board, stuck: stuck).padding(.top, Space.s)
+    }
+}
+
+/// The board isn't found, or the remembered one won't connect: how to pair it again from the start. The board takes a
+/// new phone only in the 3 minutes after power-on (ble_link.cpp PAIR_WINDOW_MS). Shown once it has been stuck a while.
+/// A Lightning iPhone can't take the board's USB mouse: switch a --dual-hid board to Bluetooth, or point an
+/// older USB-only board at the Bluetooth firmware.
+struct LightningAdvice: View {
+    @ObservedObject var board: BoardLink
+    @Binding var toBluetooth: Bool
+    @State private var busy = false
+    @State private var error: String?
+
+    var body: some View {
+        switch DeviceCaps.bluetoothAdvice(lightning: DeviceCaps.hasLightning, status: board.status) {
+        case .none: EmptyView()
+        case .switchInput:
+            Panel {
+                Label("This iPhone has no USB-C port, so the board has to be its Bluetooth mouse.", systemImage: "cable.connector.slash")
+                    .font(.subheadline)
+                Button { switchToBluetooth() } label: {
+                    HStack { Text("Switch the Board to Bluetooth"); if busy { Spacer(); ProgressView() } }
+                }
+                .font(.body.weight(.semibold)).disabled(busy).padding(.top, Space.m)
+                if let error { Text(error).font(.footnote).foregroundStyle(.red).padding(.top, Space.s) }
+            }
+        case .needsFirmware:
+            Panel {
+                Label("This iPhone has no USB-C port, so the board has to be its Bluetooth mouse, and its firmware is USB only.",
+                      systemImage: "cable.connector.slash")
+                    .font(.subheadline)
+                Text("On a computer, open \(FirmwareLinks.install.absoluteString), plug the board into it and install the Bluetooth firmware. Then come back here.")
+                    .font(.footnote).foregroundStyle(.secondary).padding(.top, Space.s)
+                Link(destination: FirmwareLinks.install) { Text(verbatim: "manina.ai/install") }
+                    .font(.footnote.weight(.semibold)).padding(.top, Space.s)
+            }
+        }
+    }
+
+    private func switchToBluetooth() {
+        busy = true
+        error = nil
+        Task {
+            do {
+                try await BluetoothSteps.switchInput(to: "ble", on: board)
+                toBluetooth = true
+            } catch {
+                self.error = String(localized: "The board did not switch: \(error.localizedDescription)")
+            }
+            busy = false
+        }
+    }
+}
+
+struct BoardRepairHint: View {
+    @ObservedObject var board: BoardLink
+    let stuck: Bool
+
+    static func shows(stuck: Bool, connected: Bool, linking: Bool, paired: Bool, found: Bool) -> Bool {
+        stuck && !connected && !linking && (paired || !found)
+    }
+
+    /// Waits ~10 s while the board stays disconnected (run it as `.task(id: board.connected)`).
+    static func wait(connected: Bool) async -> Bool {
+        guard !connected, (try? await Task.sleep(for: .seconds(10))) != nil else { return false }
+        return true
+    }
+
+    var body: some View {
+        if Self.shows(stuck: stuck, connected: board.connected, linking: board.linking,
+                      paired: board.pairedID != nil, found: !board.found.isEmpty) {
+            VStack(alignment: .leading, spacing: Space.s) {
+                Text("Board not showing up?").font(.subheadline.weight(.semibold))
+                let first = board.pairedID != nil ? 1 : 0
+                if first == 1 {
+                    Button(action: board.retryDiscovery) { step(1, "Forget this board in the app") }
+                        .buttonStyle(.borderless)  // in a List row: only the button, not the whole row
+                }
+                step(first + 1, "In Settings › Bluetooth, forget \(BoardName.current) if it is listed.")
+                step(first + 2, "Unplug the board and plug it back in.")
+                step(first + 3, "Pair within 3 minutes: after power-on the board accepts a new phone for 3 minutes only.")
+            }
+            .font(.footnote)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func step(_ n: Int, _ text: LocalizedStringKey) -> some View {
+        Label { Text(text) } icon: { Image(systemName: "\(n).circle") }
     }
 }
 
 /// A board fresh from the shop has no firmware and never shows up: point to the browser installer and the source.
+/// No board at hand: turn on Demo data from the first setup page (the same switch as Settings › Developer).
+/// It is read once at launch (MockMode), so the app says to reopen it.
+struct DemoOffer: View {
+    @AppStorage(MockMode.key) private var demoData = false
+    @State private var told = false
+
+    var body: some View {
+        Button("No board yet? Try the demo") { demoData = true; told = true }
+            .font(.footnote.weight(.semibold))
+            .alert("Demo Data Is On", isPresented: $told) {
+                Button("OK") {}
+            } message: {
+                Text("Quit \(AppName.current) and open it again to try the whole app without a board. Nothing is sent anywhere in the demo. Turn it off in Settings › Developer.")
+            }
+    }
+}
+
 struct FirmwareLinks: View {
-    static let install = URL(string: "https://handsy.tech/install")!
+    static let install = URL(string: "https://manina.ai/install")!
 
     /// One line, so both links stay above the bottom button on every iPhone.
     var body: some View {
         HStack(spacing: Space.m) {
             Text("New board?").foregroundStyle(.secondary)
-            Link(destination: Self.install) { Label { Text(verbatim: "handsy.tech/install") } icon: { Image(systemName: "desktopcomputer") } }
+            Link(destination: Self.install) { Label { Text(verbatim: "manina.ai/install") } icon: { Image(systemName: "desktopcomputer") } }
             Link(destination: AboutView.repo) {
                 Label { Text(verbatim: "GitHub") } icon: {
                     Image("GitHubMark").renderingMode(.template).resizable().scaledToFit().frame(width: 14, height: 14)
@@ -140,24 +269,86 @@ private struct TightLabel: LabelStyle {
     }
 }
 
-/// 2 · Let it see the screen: join the board's Wi-Fi (one tap, the system asks), then Screen Mirroring.
-/// The page's one action is the bottom button (OnboardingView); manual join shows only if one-tap fails.
+/// 2 · Let it see the screen: join the board's Wi-Fi (one tap, the system asks), or point the board at the
+/// home Wi-Fi (LAN mode), then Screen Mirroring. The page's one action is the bottom button (OnboardingView);
+/// manual join shows only if one-tap fails. Devices without cellular get LAN mode only.
 struct SeePage: View {
     @ObservedObject var app: AppModel
     @ObservedObject var board: BoardLink
     @Binding var onWiFi: Bool
+    @Binding var lanChoice: Bool
+    @Binding var lanSSID: String
+    @Binding var lanPass: String
+    @Binding var lanRemember: Bool
     @State private var copied = false
+    @State private var sharing = Hotspot.sharing  // this iPhone is a Personal Hotspot right now
     @Environment(\.scenePhase) private var scenePhase
 
     private var streaming: Bool { board.connected && board.status?.ap == "streaming" }
-    private var joined: Bool { app.onBoardHotspot(manual: onWiFi) }
-    private var failure: String? { if case .failed(let why) = app.join { return why } else { return nil } }
+    /// On the network of the chosen mode: a board still in the other mode doesn't count (it switches first).
+    private var joined: Bool { lanChoice == app.lanMode && app.onBoardHotspot(manual: onWiFi) }
+    private var failure: String? {
+        if case .failed(let why) = lanChoice ? app.lanJoin : .idle { return why }
+        if !lanChoice, case .failed(let why) = app.join { return why }
+        return nil
+    }
 
     var body: some View {
         VStack(spacing: Space.xl) {
-            PageHeader(mood: streaming ? .success : (app.join.busy || joined) ? .listening : failure != nil ? .failure : .idle,
+            PageHeader(mood: streaming ? .success : (app.join.busy || app.lanJoin.busy || joined) ? .listening : failure != nil ? .failure : .idle,
                        title: "Let Me See the Screen",
-                       message: "Screen Mirroring goes to the board over its own Wi-Fi.")
+                       message: lanChoice
+                           ? "Screen Mirroring goes to the board over your Wi-Fi network."
+                           : "Screen Mirroring goes to the board over its own Wi-Fi.")
+            if DeviceCaps.hasCellular {
+                Picker("Network", selection: $lanChoice) {
+                    Text("Board's Hotspot").tag(false)
+                    Text("Home Wi-Fi").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            } else {
+                Label("This device has no cellular data, so the board shares your Wi-Fi instead of opening its own hotspot.",
+                      systemImage: "wifi")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            if lanChoice { lan } else { hotspot }
+        }
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: joined)
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: app.join)
+        .task {  // join once by itself, then keep checking every 2 s while on this step
+            if !joined, !lanChoice { app.startJoin(auto: true) }
+            while !Task.isCancelled && !streaming {
+                await app.refreshHotspot()
+                sharing = Hotspot.sharing
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+        .onValueChange(of: scenePhase) { _, phase in
+            if phase == .active { sharing = Hotspot.sharing; Task { await app.refreshHotspot() } }
+        }
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: app.manualHotspot?.ssid)
+    }
+
+    /// LAN mode: the board joins the home Wi-Fi; the phone stays on whatever network it has. Once the board is on it,
+    /// the form folds away like the hotspot path's hints, so the mirroring picture is on screen, not below the fold.
+    private var lan: some View {
+        VStack(spacing: Space.xl) {
+            if !joined { LanForm(app: app, ssid: $lanSSID, pass: $lanPass, remember: $lanRemember) }
+            Panel {
+                CheckRow(title: "Board on your Wi-Fi", done: joined, active: !joined,
+                         waiting: app.lanJoin.busy && !joined,
+                         detail: app.lanJoin.busy ? "This takes up to a minute — the board restarts its Wi-Fi." : nil)
+                Divider().padding(.vertical, Space.s)
+                CheckRow(title: "Start Screen Mirroring", done: streaming, active: joined && !streaming)
+            }
+            if joined && !streaming { MirroringSteps(app: app) }
+        }
+    }
+
+    /// Hotspot mode: the phone joins the board's own Wi-Fi; the internet keeps working over cellular.
+    private var hotspot: some View {
+        VStack(spacing: Space.xl) {
             Panel {
                 CheckRow(title: "Join the board's Wi-Fi", done: joined, active: !joined, waiting: app.join.busy && !joined,
                          detail: joined ? nil : app.join == .verifying ? "Checking the connection…"
@@ -167,6 +358,12 @@ struct SeePage: View {
             }
             if !joined {
                 if let net = app.manualHotspot, let ssid = net.ssid, failure != nil { manual(ssid: ssid, pass: net.pass) }
+                if sharing {  // seen, not guessed: say it plainly, above the general hints
+                    Label("This iPhone's Personal Hotspot is on. Turn it off in Settings › Personal Hotspot, then join the board's Wi-Fi.",
+                          systemImage: "personalhotspot")
+                        .font(.subheadline.weight(.semibold)).foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 VStack(alignment: .leading, spacing: Space.s) {
                     Label("Turn off Personal Hotspot first: while it shares this iPhone's internet, the iPhone can't join the board's Wi-Fi.",
                           systemImage: "personalhotspot")
@@ -175,31 +372,9 @@ struct SeePage: View {
                 .font(.footnote).foregroundStyle(.secondary)
                 Button("I'm already on the board's Wi-Fi") { onWiFi = true }.font(.footnote)
             } else if !streaming {
-                Text("Now swipe down from the top-right corner and tap **Screen Mirroring → ESP32 Agent**.")
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                MiniPhoneDemo(kind: .controlCenter)
-                VStack(spacing: Space.s) {
-                    HStack(spacing: Space.s) {
-                        ProgressView().controlSize(.small)
-                        Text("Waiting for Screen Mirroring…")
-                    }
-                    Label("Keep the screen unlocked: locking stops mirroring.", systemImage: "lock.open")
-                }
-                .font(.footnote).foregroundStyle(.secondary)
+                MirroringSteps(app: app)
             }
         }
-        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: joined)
-        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: app.join)
-        .task {  // join once by itself, then keep checking every 2 s while on this step
-            if !joined { app.startJoin(auto: true) }
-            while !Task.isCancelled && !streaming {
-                await app.refreshHotspot()
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-            }
-        }
-        .onChange(of: scenePhase) { _, phase in if phase == .active { Task { await app.refreshHotspot() } } }
-        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: app.manualHotspot?.ssid)
     }
 
     /// One-tap join failed: the network and its password, to join in Settings › Wi-Fi.
@@ -237,25 +412,34 @@ struct ActPage: View {
     @ObservedObject var calibrator: AutoCalibrator
     @ObservedObject var pointer: Pointer
 
-    private var mouse: Bool { MockMode.on || board.status?.usb == "ok" }
+    private var mouse: Bool { MockMode.on || board.status?.inputReady == true }
     private var mirroring: Bool { MockMode.on || board.status?.ap == "streaming" }
+
+    private var calibrated: Bool { calibrator.hasValidCalibration }  // iPad: in this orientation
 
     var body: some View {
         VStack(spacing: Space.xl) {
-            PageHeader(mood: pointer.calibrated ? .success : calibrator.busy ? .acting : .idle,
+            PageHeader(mood: calibrated ? .success : calibrator.busy ? .acting : .idle,
                        title: "Let Me Use the Pointer",
-                       message: "The board is a USB mouse. iOS shows its pointer only with AssistiveTouch on. Then I calibrate on a grid, like a 3D printer levelling its bed.")
-            if !pointer.calibrated { MiniPhoneDemo(kind: .assistiveTouch) }
+                       message: board.status?.isWirelessHID == true
+                           ? "Turn on AssistiveTouch to use the board as a mouse, then calibrate the pointer on the grid."
+                           : "The board is a USB mouse. iOS shows its pointer only with AssistiveTouch on. Then I calibrate on a grid, like a 3D printer levelling its bed.")
+            if board.status?.isWirelessHID == true {
+                let deviceName = board.name.isEmpty ? String(localized: "the board connected in this app") : board.name
+                Text("On this iPhone, open Settings › Accessibility › Touch › AssistiveTouch › Devices › Bluetooth Devices and pair \(deviceName).")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            if !calibrated { MiniPhoneDemo(kind: .assistiveTouch) }
             Panel {
                 CheckRow(title: "Mouse connected", done: mouse, active: !mouse, waiting: board.connected && !mouse)
                 Divider().padding(.vertical, Space.s)
                 CheckRow(title: "Screen Mirroring on", done: mirroring, active: mouse && !mirroring)
                 Divider().padding(.vertical, Space.s)
-                CheckRow(title: "Pointer calibrated", done: pointer.calibrated, active: mouse && mirroring && !pointer.calibrated,
+                CheckRow(title: "Pointer calibrated", done: calibrated, active: mouse && mirroring && !calibrated,
                          waiting: calibrator.busy,
                          detail: pointer.quality.map { "Accuracy \(CalibrationText.percent($0))" })
             }
-            if !pointer.calibrated {
+            if !calibrated {
                 Label("Recommended: calibrate before first use.", systemImage: "scope")
                     .font(.footnote.weight(.semibold)).foregroundStyle(Color.accentColor)
                 Text("Tip: in AssistiveTouch › Pointer Devices, set Tracking Speed to the middle and turn Pointer Animations off.")
@@ -273,27 +457,30 @@ struct BrainPage: View {
     var body: some View {
         VStack(spacing: Space.xl) {
             PageHeader(mood: app.modelOK == true ? .success : app.modelOK == false ? .failure : .thinking,
-                       title: "Give Me a Brain",
-                       message: "Any OpenAI-compatible vision model works. The key stays in this iPhone's Keychain.")
+                       title: "Give Me a Brain", message: message)
             if MockMode.on {
-                Panel { Label("Demo data simulates the model.", systemImage: "theatermasks") }
+                Panel {
+                    Label("Demo data simulates the model.", systemImage: "theatermasks")
+                    // The demo still shows what a real run asks before it sends anything.
+                    let pending = settings.pendingConsent
+                    if settings.isConfigured, pending.model || pending.jev {
+                        SendConsentCard(settings: settings, model: pending.model, jev: pending.jev)
+                    }
+                }
             } else {
                 ModelFieldsPanel(settings: settings)
+                ToolsEntry()
             }
-            ModelTestTimingView(app: app)
-            switch app.modelOK {
-            case true?:
-                Panel {
-                    Label("Connected. Try this first:", systemImage: "checkmark.circle.fill").foregroundStyle(Palette.ok)
-                    Text(verbatim: IntentStore.examples[0].prompt).font(.subheadline).foregroundStyle(.secondary)
-                        .padding(.top, Space.s)
-                }
-            case false?:
-                Label(app.modelError ?? String(localized: "Could not reach the model. Check the URL and key."), systemImage: "xmark.octagon.fill")
-                    .foregroundStyle(Palette.stop).font(.subheadline)
-            case nil:
-                EmptyView()
-            }
+            if app.modelTestStarted != nil || app.modelTestSeconds != nil { ModelTestTimingView(app: app) }
+        }
+    }
+
+    /// The connection result lives in the header (and as a mark on the model row), not in a card of its own.
+    private var message: LocalizedStringKey {
+        switch app.modelOK {
+        case true?: return "Connected. Try this first: \(IntentStore.note.prompt)"
+        case false?: return "\(app.modelError ?? String(localized: "Could not reach the model. Check the URL and key."))"
+        case nil: return "Any OpenAI-compatible vision model works. The key stays in this iPhone's Keychain."
         }
     }
 }
