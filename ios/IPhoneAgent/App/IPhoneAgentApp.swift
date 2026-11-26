@@ -24,6 +24,7 @@ struct IPhoneAgentApp: App {
         _ = AppModel.shared  // also on a background launch for an App Intent, which shows no scene
         CrashReports.shared.start()
         Analytics.start()
+        Pointer.warmUpTypeable()
     }
 
     var body: some Scene {
@@ -137,7 +138,7 @@ struct RootView: View {
 
     private var tabs: some View {
         TabView(selection: $app.tab) {
-            HomeView(app: app, board: app.board, feed: app.feed, agent: app.agent, settings: settings,
+            HomeView(app: app, board: app.board, feed: app.screen, agent: app.agent, settings: settings,
                      intents: app.intents, recorder: app.recorder)
                 .tabItem { Label("Agent", image: "AgentGlyph") }  // the character, not an SF smiley
                 .tag(AppTab.agent)
@@ -156,6 +157,7 @@ struct RootView: View {
 
     private func setUp() {
         privacyAsked = true
+        BoardQuestion.skipIfOnboarded(settings.onboarded)  // set up before the board question: never asked
         if !settings.onboarded && app.setupPage == nil { app.setupPage = .welcome }
     }
 }

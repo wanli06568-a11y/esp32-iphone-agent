@@ -33,6 +33,7 @@ extension Pointer {
             guard let image = screen.frame.flatMap(Vision.image) else { return nil }
             return HanTyper.Seen(words: await UITreeOCR.lines(image, cells: true), height: image.height)
         })
+        typer.source = InputSource.shared
         typer.grab = { [weak self] in
             guard let screen = self?.screen, screen.live else { return nil }
             await screen.settled(quiet: 0.25, least: 0.4, most: 1.2)
@@ -141,10 +142,29 @@ extension Pointer {
 
     nonisolated static func typeable(_ text: String, trim: Bool = true) -> String {
         guard !text.unicodeScalars.allSatisfy({ (0x20...0x7e).contains($0.value) }) else { return text }
+        // One typing asks for the same text (and each of its characters) over and over while it plans, types and
+        // reads back; each answer built a zh tokenizer and transliterated every character on the main thread
+        // (470 ms stalls twice per field, 2026-11-26). Same text, same answer: kept.
+        let key = ((trim ? "1" : "0") + text) as NSString
+        if let hit = typeableCache.object(forKey: key) { return hit as String }
+        let out = typeableUncached(text, trim: trim)
+        typeableCache.setObject(out as NSString, forKey: key)
+        return out
+    }
+
+    nonisolated(unsafe) static let typeableCache = NSCache<NSString, NSString>()  // thread-safe; the system trims it
+
+    /// The tokenizer loads its dictionary on first use (hundreds of ms): done once off the main thread at launch.
+    nonisolated static func warmUpTypeable() {
+        Task.detached(priority: .utility) { _ = HanReading.readings("音乐银行") }
+    }
+
+    private nonisolated static func typeableUncached(_ text: String, trim: Bool) -> String {
         var out = ""
         var prevHan = false
         var last: Character?
-        for ch in text {
+        let readings = HanReading.readings(text)  // by word: 音乐 is yinyue, not yinle
+        for (at, ch) in text.enumerated() {
             defer { last = ch }
             if "…—".contains(ch), last == ch { continue }  // "……" and "——": one key makes the pair
             let s = String(ch)
@@ -158,7 +178,7 @@ extension Pointer {
                 .applyingTransform(.stripDiacritics, reverse: false) ?? punct
             let kept = String(String.UnicodeScalarView(latin.unicodeScalars.filter { (0x20...0x7e).contains($0.value) }))
             if isHan {
-                let syllable = kept.replacingOccurrences(of: " ", with: "")
+                let syllable = readings[at] ?? kept.replacingOccurrences(of: " ", with: "")
                 // xi'an, not xian: a syllable starting with a vowel after another Han syllable gets the pinyin
                 // keyboard's separator, else 西岸 reads as xian (先, 现) and the word is never among the candidates
                 // (2026-11-20, 上海西岸艺术中心 stopped at 西 in every run)

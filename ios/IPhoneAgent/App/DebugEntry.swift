@@ -240,7 +240,7 @@ extension AppModel {
             }
         }
         if let requested = value(after: "-setup"),
-           let page = ["connect": SetupPage.connect, "brain": .brain][requested] { setupPage = page }
+           let page = ["connect": SetupPage.connect, "act": .act, "brain": .brain][requested] { setupPage = page }
         if args.contains("-test-model") { Task { await pingLLM() } }
         if let dir = value(after: "-harness-ota") { harnessOTA(dir) }  // harness/fw.sh
         if let commands = value(after: "-hid") { harnessHID(commands) }  // harness/hid.sh
@@ -294,12 +294,19 @@ extension AppModel {
             guard let self else { return }
             switch name {
             case "stop":
-                await stopAgent()
+                await stopAgent(by: "debug")
+                // harness/run.sh starts the next task on this line: the stopped run's late "finished:" ended the next one
+                let deadline = now() + 15
+                while (agent.running || startingAgent), now() < deadline { try? await Task.sleep(nanoseconds: 200_000_000) }
+                say("debug: stopped")
             case "run":
                 guard await waitReady(mirroring: true) else { return say("debug: run not started, board/mirroring not ready in 30 s") }
                 guard !agent.running else { return say("debug: a run is already going") }
                 tab = .agent
-                await run(task)
+                // the intent with these words, so a harness run reuses its plan and learned steps like a tap on it
+                let intent = intents.items.first { $0.prompt == task }
+                if let intent { say("debug: run as the intent \"\(intent.name)\"") }
+                await run(task, intent: intent)
             case "calibrate":
                 guard await waitReady(mirroring: false) else { return say("debug: board not ready in 30 s") }
                 calibrator.calibrate()
@@ -423,7 +430,9 @@ extension AppModel {
             var moved = false
             for command in commands.split(separator: ";").map({ $0.trimmingCharacters(in: .whitespaces) }) where !command.isEmpty {
                 let reply: String
-                if command.hasPrefix("wait "), let s = Double(command.dropFirst(5)) {  // "wait 1.2": seconds
+                if command == "stay" {  // leave the pointer where these moves put it (harness/tapcv.py finds it on a screenshot)
+                    reply = "ok"
+                } else if command.hasPrefix("wait "), let s = Double(command.dropFirst(5)) {  // "wait 1.2": seconds
                     try? await Task.sleep(nanoseconds: UInt64(s * 1e9))
                     reply = "ok"
                 } else if command == "homeup" || command.hasPrefix("homeup ") {  // HomeTuning for this orientation
@@ -443,13 +452,13 @@ extension AppModel {
                        let p = await pointer.landing(xy[0] / 1000, xy[1] / 1000) {
                         reply = String(format: "landed %.0f %.0f", p.x * 1000, p.y * 1000)
                     } else { reply = "err not found" }
-                } else if command == "shot" {  // the mirrored screen now, for harness/hid.sh to pull
-                    await feed.settled(most: 1.5)
+                } else if command == "shot" {  // the run's screen now (mirrored or captured), for harness/hid.sh to pull
+                    await screen.settled(most: 1.5)
                     let name = "harness-shots/\(Int(Date().timeIntervalSince1970)).jpg"  // in Documents/developer
                     let url = FilesLayout.developer.appendingPathComponent(name)
                     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    reply = (try? feed.frame?.write(to: url)) != nil ? "saved " + name : "err no frame"
-                    if let jpeg = feed.frame { HarnessLink.shared.sendFile(name, jpeg) }  // harness/live.py saves it
+                    reply = (try? screen.frame?.write(to: url)) != nil ? "saved " + name : "err no frame"
+                    if let jpeg = screen.frame { HarnessLink.shared.sendFile(name, jpeg) }  // harness/live.py saves it
                 } else {
                     do { reply = try await board.commands.send(command) } catch { reply = "err " + error.localizedDescription }
                     if command == "home" || command.hasPrefix("move") { moved = true }
@@ -459,7 +468,7 @@ extension AppModel {
             }
             // raw moves leave the pointer where the app doesn't think it is: the next run's home-bar flick pressed
             // mid-screen and never left the app (2026-11-06). Once at the end, so "home; move …; move …" composes.
-            if moved { try? await pointer.reset() }
+            if moved && !commands.contains("stay") { try? await pointer.reset() }
             say("harness hid: done")
         }
     }
@@ -471,7 +480,7 @@ extension AppModel {
         let deadline = now() + timeout
         while now() < deadline {
             let s = board.status
-            if board.connected && s?.inputReady == true && (!mirroring || s?.ap == "streaming") { return true }
+            if board.connected && s?.inputReady == true && (!mirroring || onDeviceCapture || s?.ap == "streaming") { return true }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         return false

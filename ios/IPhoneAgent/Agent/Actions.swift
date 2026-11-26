@@ -15,7 +15,7 @@ enum Actions {
     static let actions: [String: [String]] = [
         "tap": ["x", "y"], "swipe": ["x1", "y1", "x2", "y2"], "circle": ["x", "y", "r"], "path": ["points"],
         "type": ["text"], "clear": [], "key": ["combo"], "done": ["answer"], "fail": ["reason"], "confirm": ["reason"],
-        "home": [], "back": [], "wait": [], "open": ["app"],
+        "home": [], "back": [], "wait": [], "open": ["app"], "switch": [],
         "read": ["what"], "collect": ["what"], "find": ["text"], "each": ["text"], "note": ["text"], "progress": ["text"], "remember": ["text"], "learn": ["text"], "write": [],
         "tool": ["text"],  // tool <name> "query" (Tools.swift)
         "guide": ["text"],  // guide APP: that app's notes from the server (AppGuides.swift)
@@ -25,9 +25,25 @@ enum Actions {
     ]
     static let textArgs: Set<String> = ["text", "combo", "answer", "reason", "what", "app"]
     /// Actions that touch the screen.
-    static let gestures: Set<String> = ["tap", "swipe", "circle", "path", "type", "clear", "key", "home", "back", "open", "say"]
+    static let gestures: Set<String> = ["tap", "swipe", "circle", "path", "type", "clear", "key", "home", "back", "open", "say", "switch"]
     /// Actions that touch the notebook or memory, not the screen (AgentLoop+Memory).
     static let notebookActions: Set<String> = ["read", "note", "progress", "remember", "learn", "write", "tool", "guide", "file", "snap"]
+
+    /// "tap X Y twice": two clicks at one spot, the second where the first landed (a game's "tap twice", choose
+    /// then confirm). Kingdom Rush, 2026-11-26: the second of two taps was aimed again, landed 15 units off, and
+    /// neither the tower nor the wave call took.
+    static func twice(_ rest: String) -> Bool {
+        let r = rest.lowercased()
+        return r.contains("twice") || r.contains("double")
+    }
+
+    /// "tap X Y hold": press and hold about a second, then lift (a long press: a chat message's menu with 转发 /
+    /// Forward, an icon's quick actions). WeChat, 2026-11-26: with no long press the model tried a swipe of zero
+    /// length, nothing opened, and the run asked for help at step 8.
+    static func held(_ rest: String) -> Bool {
+        let r = rest.lowercased()
+        return r.contains("hold") || r.contains("long")
+    }
 
     /// One DO line, e.g. "tap 152 362" -> {"action": "tap", "x": 152, "y": 362}.
     static func parseCommand(_ line: String) throws -> JObject {
@@ -52,6 +68,9 @@ enum Actions {
             return action
         }
         let numbers = matches(#"-?\d+(?:\.\d+)?"#, in: rest).compactMap { Double($0) }.map { Int($0) }
+        if name == "wait", let n = numbers.first {  // wait 10: that long, for a video or an ad to end
+            return ["action": .str(name), "seconds": .num(min(max(Double(n), 1), WaitFor.most))]
+        }
         // tap 发送: words without quotes and no numbers are the words too (Qwen wrote it so; the whole reply was taken
         // as off-format and asked again, 5 s, in most runs of 2026-11-23)
         if name == "tap", numbers.isEmpty {
@@ -77,6 +96,8 @@ enum Actions {
         var action: JObject = ["action": .str(name)]
         for (k, n) in zip(keys, numbers) { action[k] = .int(n) }
         if name == "tap" && rest.lowercased().contains("precise") { action["precise"] = .bool(true) }
+        if name == "tap", Self.twice(rest) { action["count"] = .int(2) }
+        if name == "tap" || name == "swipe", Self.held(rest) { action["hold"] = .bool(true) }
         return action
     }
 
@@ -102,6 +123,14 @@ enum Actions {
         guard !acts.isEmpty else { throw ParseError(message: "no DO line in reply: \(text.prefix(200))") }
         acts = blindSafe(acts)
         acts[0] = JObject([("thought", .str(thought ?? "")), ("thought_zh", .str(zh ?? ""))]).merging(acts[0])
+        // a bare `DO: fail` or `DO: done` told the user nothing (2026-11-26: 汽水音乐 not installed, the reason only
+        // in THINK; 你好明天 written, done with no answer): the model's own words go in
+        for (name, key) in [("fail", "reason"), ("done", "answer")] {
+            if let i = acts.firstIndex(where: { $0["action"]?.str == name }), (acts[i][key]?.str ?? "").isEmpty,
+               let why = [zh, thought].compactMap({ $0 }).first(where: { !$0.isEmpty }) {
+                acts[i][key] = .str(why)
+            }
+        }
         return acts
     }
 

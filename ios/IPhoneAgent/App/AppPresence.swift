@@ -168,7 +168,7 @@ extension AppModel {
                 try await Task.sleep(nanoseconds: 300_000_000)
             }
             try Task.checkCancellation()
-            if waited && FrameMode.current == .stream {
+            if !onDeviceCapture && waited && FrameMode.current == .stream {
                 do { try await feed.stream(true) }
                 catch {
                     try Task.checkCancellation()
@@ -209,6 +209,28 @@ extension AppModel {
 
     /// Try a short stream wait, then explicitly snap; a static Home Screen must not stall startup.
     func waitForStartupFrame(boundary: StartupFrameBoundary, snapMode: Bool) async throws -> String {
+        if onDeviceCapture {
+            let nudgeAfter = now() + 0.5
+            var nudged = false
+            while true {
+                try Task.checkCancellation()
+                try screen.checkAvailability()
+                guard appIsBackgrounded else { throw onScreenError() }
+                if screen.live, boundary.accepts(capturedAt: screen.capturedAt, backgroundEnteredAt: backgroundEnteredAt) {
+                    await screen.settled(most: 1.5)
+                    try screen.checkAvailability()
+                    return "on-device"
+                }
+                if !nudged, now() >= nudgeAfter {
+                    try await startupBoardCommand { try await nudgeStartupPointer() }
+                    nudged = true
+                }
+                guard now() < startupDeadline else {
+                    throw ScreenCaptureError(message: String(localized: "No screen image arrived. Stop sharing and try again."))
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
         let began = now()
         var recovery = Recovery(at: began, limit: max(0, startupDeadline - began))
         // A still Home Screen sends no new frame on its own: nudge the cursor almost at once instead of waiting 3 s
@@ -233,6 +255,7 @@ extension AppModel {
         }
         var logged = 0.0
         var shownStage: Recovery.Stage?, shownPoll = 0.0  // for the log: transitions only
+        var noVideoSince: Double?
         RunMarker.set("startup: waiting for the first frame")
         while true {
             if now() - logged >= 1 {  // why there is no usable frame yet, once a second
@@ -247,6 +270,21 @@ extension AppModel {
             guard now() < startupDeadline else { throw DeviceError(message: Recovery.reason(.frames)) }
             try Task.checkCancellation()
             guard appIsBackgrounded else { throw onScreenError() }
+            if board.connected, Recovery.noVideo(ap: board.status?.ap, gop: board.status?.gop, fps: board.status?.fps,
+                                                 hasFrame: feed.frame != nil) {
+                let since = noVideoSince ?? now()
+                if noVideoSince == nil {
+                    noVideoSince = since
+                    DebugLog.write("startup: mirroring connected but the board has no video (gop 0, fps 0)")
+                }
+                if now() - since >= Recovery.noVideoAfter {
+                    DebugLog.write(String(format: "startup: still no video after %.0f s; stopping", now() - since))
+                    Analytics.capture("startup_no_video", ["after": Int(now() - began)])
+                    throw DeviceError(message: Recovery.noVideoReason)
+                }
+            } else {
+                noVideoSince = nil
+            }
             if hasFrame(), board.connected, board.status?.inputState != nil, board.status?.needsWirelessPointer != true, !snapMode || receivedSnapshot {
                 await feed.settled(most: 1.5)  // the nudged cursor keeps fading for seconds; the Home Screen is still
                 try Task.checkCancellation()
@@ -312,10 +350,7 @@ extension AppModel {
                 if !requestedMotion {
                     // A static Home frame may predate its notification. Move only the cursor to request
                     // a genuinely newer image; no tap, model call, or timestamp tolerance is involved.
-                    try await pointer.point(0.5, 0.5, aim: false)
-                    try Task.checkCancellation()
-                    guard appIsBackgrounded else { throw onScreenError() }
-                    try await pointer.point(0.55, 0.5, aim: false)
+                    try await nudgeStartupPointer()
                     requestedMotion = true
                     motionAt = now()
                     // The cursor change is streamed within a second; snapping the whole GOP over BLE
@@ -357,8 +392,17 @@ extension AppModel {
     /// iPad: the calibration was made in another orientation or mirrored shape than the screen has now, so every
     /// tap would land elsewhere. Never on iPhone (no geometry).
     func validateRunGeometry() throws {
-        guard feed.geometry != nil, calibrator.rotated else { return }
+        guard screen.geometry != nil, calibrator.rotated else { return }
         throw BlindError(reason: String(localized: "The iPad was rotated since the pointer was calibrated. Stop, calibrate it in this orientation, and try again."))
+    }
+
+    /// Request a genuinely new image of a static Home Screen without tapping anything.
+    private func nudgeStartupPointer() async throws {
+        guard appIsBackgrounded else { throw onScreenError() }
+        try await pointer.point(0.5, 0.5, aim: false)
+        try Task.checkCancellation()
+        guard appIsBackgrounded else { throw onScreenError() }
+        try await pointer.point(0.55, 0.5, aim: false)
     }
 
     /// Before each look and gesture of a run. If the agent itself brought the app to the front (it tapped our
@@ -384,15 +428,15 @@ extension AppModel {
             defer { homeHint = nil }
             while !appIsBackgrounded {
                 try Task.checkCancellation()
-                if !feed.live {
+                if !screen.live {
                     _ = try await agent.waitForScreen()
                     live.show(.pausedInApp, mood: .thinking)
                 }
                 try await Task.sleep(nanoseconds: 300_000_000)
             }
         }
-        _ = await feed.fresh(since: since, timeout: 3)  // a frame of the screen that is in front now
-        await feed.settled()
+        _ = await screen.fresh(since: since, timeout: 3)  // a frame of the screen that is in front now
+        await screen.settled()
         DebugLog.write("run: app in background again, going on")
     }
 
@@ -406,8 +450,12 @@ extension AppModel {
         let began = now()
         for url in AppNames.schemeURLs(app) {
             guard !appIsBackgrounded, !Task.isCancelled else { return false }
-            guard await UIApplication.shared.open(url) else { continue }
+            // Not awaited: while iOS asks "Open in X?", open's answer waits for that tap, and the tap below never came
+            // (a harness run hung 30 min on it, 2026-11-26). An app that isn't there answers false within the wait.
+            let answer = OpenAnswer()
+            UIApplication.shared.open(url, options: [:]) { answer.value = $0 }
             var away = (try? await waitForBackground(0.8)) ?? false
+            if !away, answer.value == false { continue }
             // Still here: most likely iOS asks first. Said in the middle of the screen until the app leaves (a toast
             // went unseen under the take-off screen, Henry 2026-11-20).
             let hint = homeHint
@@ -436,7 +484,7 @@ extension AppModel {
     /// The system prompt that asks before another app opens: its 打开 / Open button, tapped by the board.
     static let openWords = ["打开", "Open", "開啟", "打開"]
     private func tapOpenPrompt() async -> Bool {
-        guard board.connected, let frame = feed.frame, let image = Vision.image(frame) else { return false }
+        guard board.connected, let frame = screen.frame, let image = Vision.image(frame) else { return false }
         let lines = await UITreeOCR.lines(image, whole: true)
         let size = CGSize(width: image.width, height: image.height)
         for word in Self.openWords {
@@ -484,3 +532,6 @@ enum StartupFailure {
         return "other"
     }
 }
+
+/// open(url)'s answer, set when iOS gives it (after the "Open in X?" prompt, if one is shown).
+@MainActor private final class OpenAnswer { var value: Bool? }

@@ -13,6 +13,7 @@ import UIKit
     /// A landing that missed by more than maxMiss re-homes at once instead (see `landing`).
     static let rehomeEvery = 10
     static let samplesVersion = 4  // 2: landings before a big miss re-homed; 3: firmware pace 2 moves differently; 4: video recalibration samples lacked the origin
+    static let longPress = 1.0             // s held for a long press (iOS opens the menu at ~0.5 s)
     static let hold = 0.35                  // s to rest before lifting, so iOS adds no momentum
     static let tapGap = 0.15                // s to stay still after a click, so iOS sees a finished tap
     static let nudge = 12                   // mouse units the pointer is wiggled by to find it on screen
@@ -57,7 +58,24 @@ import UIKit
     /// Where the calibration is kept. iPad: one file per orientation (`adopt`), named after `baseFile`.
     private var file: URL
     private let baseFile: URL
-    @Published private(set) var span: Span?  // mouse units needed to cross the full screen width / height
+    @Published private(set) var calibratedSpan: Span?  // mouse units needed to cross the full screen width / height
+    /// `calibratedSpan` for the screen as it is now. iPhone: an app in landscape (a game) turns the pointer's axes
+    /// with it, so the long side is the width: the calibration's sides swap. Calibrated in portrait, a target at x 0.87
+    /// of Kingdom Rush landed at x 0.35, on a locked mode button (2026-11-26). iPad keeps one per orientation (`adopt`).
+    var span: Span? {
+        guard let s = calibratedSpan else { return nil }
+        guard !Self.iPadPointer, let aspect = screen?.aspect, aspect.isFinite, aspect > 0 else { return s }
+        return Self.turned(s, landscape: aspect > 1)
+    }
+
+    /// The screen is turned from the calibration (iPhone, a landscape app): its corner offset is for the other
+    /// orientation, so it is left out, and landings go to their own table (`key`).
+    var turnedNow: Bool { calibratedSpan != nil && span != calibratedSpan }
+
+    /// The sides of `s` for a landscape or portrait screen (the long side across a landscape one).
+    nonisolated static func turned(_ s: Span, landscape: Bool) -> Span {
+        (s.w > s.h) == landscape || s.w == s.h ? s : Span(w: s.h, h: s.w)
+    }
     /// Where home really leaves the pointer (screen fraction). Going left, then up the left edge, the rounded corner
     /// pushes it in to about x 0.14 (2026-11-06): steady, so it is part of the calibration, not learned drift.
     private(set) var origin = CGPoint.zero
@@ -112,11 +130,11 @@ import UIKit
     }
 
     private func load(_ saved: Saved) {
-        span = Span(w: saved.w, h: saved.h)
+        calibratedSpan = Span(w: saved.w, h: saved.h)
         (quality, aspect, pace, geometry) = (saved.quality, saved.aspect, saved.pace ?? 1, saved.geometry)
         origin = CGPoint(x: saved.ox ?? 0, y: saved.oy ?? 0)
         gain = (saved.gain ?? []).filter { $0.count == 2 }.map { ($0[0], $0[1]) }
-        for axis in ["x", "y"] where saved.v == Self.samplesVersion {
+        for axis in ["x", "y", "lx", "ly"] where saved.v == Self.samplesVersion {
             seen[axis] = (saved.seen?[axis] ?? []).filter { $0.count == 2 }.map { ($0[0], $0[1]) }.suffix(12)
         }
     }
@@ -126,7 +144,7 @@ import UIKit
 
     /// Back to a `snapshot`: the previous calibration, or none (issue #96: a ±49.8% check was kept and used).
     func restore(_ snapshot: Data?) {
-        (span, quality, aspect, pace, origin, gain, geometry) = (nil, nil, nil, 1, .zero, [], nil)
+        (calibratedSpan, quality, aspect, pace, origin, gain, geometry) = (nil, nil, nil, 1, .zero, [], nil)
         (seen, pos) = (["x": [], "y": []], nil)
         if let snapshot, let saved = try? JSONDecoder().decode(Saved.self, from: snapshot) {
             load(saved)
@@ -165,7 +183,7 @@ import UIKit
         let target = Self.file(for: current, base: baseFile)
         guard target != file || calibrated else { return }  // this orientation has none: nothing to load again
         file = target
-        (span, quality, aspect, pace, origin, gain, geometry) = (nil, nil, nil, 1, .zero, [], nil)
+        (calibratedSpan, quality, aspect, pace, origin, gain, geometry) = (nil, nil, nil, 1, .zero, [], nil)
         (seen, pos) = (["x": [], "y": []], nil)
         if let data = try? Data(contentsOf: target), let saved = try? JSONDecoder().decode(Saved.self, from: data) {
             load(saved)
@@ -187,6 +205,11 @@ import UIKit
         guard let current else { return false }
         return geometry?.matches(current) == true
     }
+
+    /// The landings of a turned screen (a landscape app on an iPhone calibrated in portrait) have their own table,
+    /// "lx"/"ly": its axes and corner differ, so mixing them in would bend portrait taps, and leaving them out kept a
+    /// steady 3-4% x miss in Kingdom Rush uncorrected (2026-11-26).
+    private func key(_ axis: String) -> String { turnedNow ? "l" + axis : axis }
 
     private func remember(_ axis: String, _ sample: (Double, Double)) {
         seen[axis] = Array((seen[axis, default: []] + [sample]).suffix(12))  // deque(maxlen=12)
@@ -225,7 +248,7 @@ import UIKit
             return false
         }
         try checkRotation(since: started)
-        span = s
+        calibratedSpan = s
         // the corner the board homes to is not exactly (0, 0): fit that offset from the same two stops. Keeping an
         // older one (a touch probe's 0.142) while the samples left it out made `fix` learn a -7% x shift: every tap
         // landed left of its target after a mid-run recalibration (2026-11-11 Maps run).
@@ -282,7 +305,7 @@ import UIKit
             log(String(format: "calibration: tap at (%.3f, %.3f) gives no usable span", x, y))
             return
         }
-        span = s
+        calibratedSpan = s
         seen = ["x": [], "y": []]
         save()
     }
@@ -294,7 +317,7 @@ import UIKit
             log(String(format: "calibration: touch probe slopes %.5f / %.5f give no usable span", x.a, y.a))
             return
         }
-        span = s
+        calibratedSpan = s
         (quality, aspect, pace) = (max(x.rms, y.rms), screenAspect(), boardPace ?? pace)
         (origin, gain, geometry) = (CGPoint(x: x.b, y: y.b), [], currentGeometry())
         seen = ["x": [], "y": []]
@@ -379,7 +402,8 @@ import UIKit
             // landing asks Recalibration for a new calibration (within its limits); then the move once more.
             guard let again = try await measureSure(x, y) else { return }
             learn(x, y, again)
-            if recalibration.take() {
+            let farAgain = max(abs(Double(again.x) - x), abs(Double(again.y) - y)) > Self.maxMiss
+            if recalibration.take() || (farAgain && recalibration.farFromCorner()) {
                 try await recalibrate()
                 try await moveTo(dx(x), dy(y))
             } else if max(abs(Double(again.x) - x), abs(Double(again.y) - y)) <= Self.maxMiss {
@@ -409,9 +433,10 @@ import UIKit
         let far = max(abs(Double(found.x) - x), abs(Double(found.y) - y)) > Self.maxMiss
         let rehome = recalibration.measured(CGPoint(x: x, y: y), found, pixels: Recalibration.pixels, confirmed: far)
         if rehome { log("pointer: far landing seen twice; re-homing, calibrating again only if the next one is far too") }
+        if far { StepReport.shared.farLanding() }
         guard !far else { return rehome }
-        remember("x", (fix(x, "x"), Double(found.x)))
-        remember("y", (fix(y, "y"), Double(found.y)))
+        remember(key("x"), (fix(x, "x"), Double(found.x)))
+        remember(key("y"), (fix(y, "y"), Double(found.y)))
         save()
         return rehome
     }
@@ -489,7 +514,9 @@ import UIKit
         let sentNudge = Self.iPadPointer ? paced(nudge, 0).0 : nudge
         let started = now()
         wiggle = nil
-        await screen.settled(quiet: 0.15, least: 0.1, most: 0.6)  // pointer at rest
+        // pointer at rest; a screen that never stands still (a game) gives no quiet gap, so the wait is short there:
+        // 0.6 s per look on every measure, 23 measures in one run (2026-11-26, Kingdom Rush)
+        await screen.settled(quiet: 0.15, least: 0.1, most: StepWaits.moving || StepWaits.alwaysMoving ? 0.2 : 0.6)
         // what moves by itself (a clock, a spinner) in a short look before the nudge can't be the pointer. The time
         // the settled screen has already shown no change counts toward that look (2026-11-11: the full 0.3 s on top
         // of every settle; the frame is the same one throughout, so the look sees the same)
@@ -533,8 +560,9 @@ import UIKit
     /// `reach`: Vision.pointer's default (iPhone), or that much of the content on a letterboxed iPad frame.
     nonisolated private static func find(_ a: Data, _ b: Data, near: CGPoint, shift: Double,
                                          reach: CGPoint = CGPoint(x: 0.12, y: 0.08), quiet: [CGRect]) -> CGPoint? {
-        Vision.pointer(a, b, near: near, shift: shift, reach: reach, quiet: quiet)
-            ?? Vision.pointer(a, b, near: CGPoint(x: 0.5, y: 0.5), shift: shift, reach: CGPoint(x: 0.5, y: 0.5), quiet: quiet)
+        guard let (ga, gb) = Vision.pointerFrames(a, b) else { return nil }
+        return Vision.pointer(ga, gb, near: near, shift: shift, reach: reach, quiet: quiet)
+            ?? Vision.pointer(ga, gb, near: CGPoint(x: 0.5, y: 0.5), shift: shift, reach: CGPoint(x: 0.5, y: 0.5), quiet: quiet)
     }
 
     /// A second reading of where the last measure found the pointer, from its move back (the frame after the nudge
@@ -574,7 +602,7 @@ import UIKit
 
     /// Demo data: pretend a calibration with this quality.
     func mockCalibrated(quality: Double) {
-        span = span ?? Span(w: 400, h: 860)
+        calibratedSpan = calibratedSpan ?? Span(w: 400, h: 860)
         geometry = currentGeometry()
         self.quality = quality
     }
@@ -582,7 +610,7 @@ import UIKit
     /// The fraction to aim at so the pointer lands on t, from the line through the observed landings.
     func fix(_ t: Double, _ axis: String) -> Double {
         if absolute { return t }
-        let pts = seen[axis] ?? []
+        let pts = seen[key(axis)] ?? []
         guard pts.count >= 2 else { return t }
         let n = Double(pts.count)
         let mc = pts.map(\.0).reduce(0, +) / n, mf = pts.map(\.1).reduce(0, +) / n
@@ -717,16 +745,46 @@ import UIKit
         try await Task.sleep(nanoseconds: UInt64(Self.tapGap * 1e9))
     }
 
+    func clickAgain() async throws {
+        log("tap again: one more click where the pointer is")
+        try await device.send("click")
+        try await Task.sleep(nanoseconds: UInt64(Self.tapGap * 1e9))
+    }
+
+    func longPress(_ x: Double, _ y: Double) async throws {
+        lastTapAt = CGPoint(x: x, y: y)
+        try await point(x, y)
+        log(String(format: "long press (%.3f, %.3f)", x, y))
+        try await device.send("press")
+        do { try await Task.sleep(nanoseconds: UInt64(Self.longPress * 1e9)) } catch {
+            _ = try? await device.send("release")
+            throw error
+        }
+        try await device.send("release")
+        try await Task.sleep(nanoseconds: UInt64(Self.tapGap * 1e9))
+    }
+
     func swipe(_ x1: Double, _ y1: Double, _ x2: Double, _ y2: Double, hold: Bool = true) async throws {
         try await drag([CGPoint(x: x1, y: y1), CGPoint(x: x2, y: y2)], hold: hold)
     }
 
+    func pressDrag(_ x1: Double, _ y1: Double, _ x2: Double, _ y2: Double) async throws {
+        log(String(format: "press and drag (%.3f, %.3f) to (%.3f, %.3f)", x1, y1, x2, y2))
+        try await drag([CGPoint(x: x1, y: y1), CGPoint(x: x2, y: y2)], hold: true, still: Self.longPress * 0.8)
+    }
+
+    func switchApp() async throws { try await switchToPreviousApp() }
+
     /// Press at the first point, move through the rest, release: one continuous stroke. hold rests at the end
     /// first, so lists and pickers stop exactly there; system gestures (home, back) need the flick.
-    func drag(_ points: [CGPoint], hold: Bool = true) async throws {
+    func drag(_ points: [CGPoint], hold: Bool = true) async throws { try await drag(points, hold: hold, still: 0) }
+
+    /// still: seconds to stand still after the press, before moving (a press and drag).
+    func drag(_ points: [CGPoint], hold: Bool, still: Double) async throws {
         try await point(Double(points[0].x), Double(points[0].y))
         do {
             try await device.send("press")
+            if still > 0 { try await Task.sleep(nanoseconds: UInt64(still * 1e9)) }
             var from = points[0]
             for (i, p) in points.dropFirst().enumerated() {
                 if hold && absolute && i == 0 {  // ease in: the first part slowly, so the page follows without a jerk
@@ -897,11 +955,11 @@ import UIKit
 
     private func dx(_ x: Double) -> Int {
         if absolute { return Int((min(max(x, 0), 1) * Double(Self.absoluteSpan.w)).rounded(.toNearestOrEven)) }
-        return Int(((min(max(fix(x, "x"), 0), 1) - origin.x) * Double(span!.w)).rounded(.toNearestOrEven))
+        return Int(((min(max(fix(x, "x"), 0), 1) - (turnedNow ? 0 : origin.x)) * Double(span!.w)).rounded(.toNearestOrEven))
     }
     private func dy(_ y: Double) -> Int {
         if absolute { return Int((min(max(y, 0), 1) * Double(Self.absoluteSpan.h)).rounded(.toNearestOrEven)) }
-        return Int(((min(max(fix(y, "y"), 0), 1) - origin.y) * Double(span!.h)).rounded(.toNearestOrEven))
+        return Int(((min(max(fix(y, "y"), 0), 1) - (turnedNow ? 0 : origin.y)) * Double(span!.h)).rounded(.toNearestOrEven))
     }
 }
 
